@@ -2,6 +2,17 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.2.0.1] - 2026-04-07
+
+### Added
+
+- Recommended brain schema doc (`docs/GBRAIN_RECOMMENDED_SCHEMA.md`): full MECE directory structure, compiled truth + timeline pages, enrichment pipeline, resolver decision tree, skill architecture, and cron job recommendations. The OpenClaw paste now links to this as step 5.
+
+### Changed
+
+- First-time experience rewritten. "Try it" section shows your own data, not fictional PG essays. OpenClaw paste references the GitHub repo, includes bun install fallback, and has the agent pick a dynamic query based on what it imported.
+- Removed all references to `data/kindling/` (a demo corpus directory that never existed).
+
 ## [0.2.0] - 2026-04-05
 
 ### Added

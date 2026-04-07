@@ -3,24 +3,30 @@
 Open source personal knowledge brain. Postgres + pgvector + hybrid search that actually works.
 
 ```bash
-gbrain query "what does Paul Graham say about doing things that don't scale?"
+# You have 342 markdown files scattered across repos. GBrain makes them searchable.
+gbrain import ~/git/brain/
+# Imported 342 files (1,847 chunks) into Supabase. Embedding...
+```
+
+```bash
+gbrain query "what are our biggest risks right now?"
 ```
 
 ```
-concepts/do-things-that-dont-scale (concept) score=0.0312
-  The most common unscalable thing founders have to do at the start is to
-  recruit users manually. Nearly all startups have to...
+strategy/competitive-moats (concept) score=0.0312
+  A durable competitive advantage comes from compounding effects that
+  are hard to replicate. Network effects, switching costs, scale...
 
-concepts/how-to-get-startup-ideas (concept) score=0.0298
-  The way to get startup ideas is not to try to think of startup ideas.
-  It's to look for problems, preferably problems you have yourself...
+meetings/2025-03-board-prep (source) score=0.0298
+  Board discussion covered market positioning against three emerging
+  competitors. Key concern: pricing pressure in enterprise segment...
 
-concepts/relentlessly-resourceful (concept) score=0.0251
-  Not merely relentless. That's not enough to make things go your way
-  except in a few mostly uninteresting domains. In any interesting domain...
+people/jane-chen (person) score=0.0251
+  VP Strategy. Led the competitive analysis project in Q1. Published
+  internal framework for evaluating competitive threats...
 ```
 
-Hybrid search finds essays by meaning, not just keywords. "Doing things that don't scale" matches even when the exact phrase doesn't appear. That's the point.
+Hybrid search finds knowledge by meaning, not just keywords. "Biggest risks" matches pages about competitive moats, board prep, and strategy leads even when the exact phrase doesn't appear. That's the point.
 
 ## Why this exists
 
@@ -32,33 +38,51 @@ GBrain fixes this with hybrid search that combines both approaches, plus a knowl
 
 AI agents maintain the brain. You ingest a document and the agent updates every entity mentioned, creates cross-reference links, and appends timeline entries. MCP clients query it. The intelligence lives in fat markdown skills, not application code.
 
-## Try it: Paul Graham's essays in 90 seconds
+## Try it: your files, searchable in 90 seconds
 
-GBrain ships with 10 Paul Graham essays as a kindling corpus. After setup, they're already in your brain:
+GBrain doesn't ship with demo data. It finds YOUR markdown and makes it searchable.
 
-```bash
-# What's in there?
-gbrain stats
-# Pages: 10, Chunks: 47, Embedded: 47, Links: 0
+**Act 1: Discovery.** GBrain scans your machine for markdown repos.
 
-# Keyword search (fast, exact matches)
-gbrain search "startups"
+```
+=== GBrain Environment Discovery ===
 
-# Hybrid search (the good one, semantic + keyword + expansion)
-gbrain query "what makes a great founder?"
+  ~/git/brain (2.3GB, 342 .md files, 87 binary files)
+    Type: Plain markdown (ready for import)
 
-# Read a specific essay
-gbrain get concepts/do-things-that-dont-scale
+  ~/Documents/obsidian-vault (180MB, 1,203 .md files, 0 binary files)
+    Type: Obsidian vault (wikilink conversion available)
 
-# Find essays related to a concept
-gbrain query "when should you ignore conventional wisdom?"
-
-# Check brain health
-gbrain health
-# Pages: 10, Embed coverage: 100%, Stale: 0, Orphans: 10
+=== Discovery Complete ===
 ```
 
-The essays are just the demo. The real power is when you import your own knowledge, thousands of pages about people, companies, projects, and the connections between them.
+**Act 2: Import.** Your files move from the repo into Supabase.
+
+```bash
+gbrain import ~/git/brain/
+# Imported 342 files into Supabase (1,847 chunks). Embedding in background...
+
+gbrain stats
+# Pages: 342, Chunks: 1,847, Embedded: 0 (embedding...), Links: 0
+```
+
+**Act 3: Search.** The agent picks a query from your actual content.
+
+```bash
+# The agent reads your corpus and picks a relevant query
+gbrain query "what do we know about competitive dynamics?"
+# 3 results, scored by hybrid search (vector + keyword + RRF fusion)
+
+# 30 seconds later, embeddings finish:
+gbrain stats
+# Pages: 342, Chunks: 1,847, Embedded: 1,847, Links: 0
+
+# Now semantic search is live too
+gbrain query "what are our biggest risks right now?"
+# Finds pages about moats, board prep, and strategy -- by meaning, not keywords
+```
+
+Your file count will be different. Your queries will be different. The agent picks them based on what it imported. That's the point: this is YOUR brain, not a demo.
 
 ## Install
 
@@ -85,26 +109,27 @@ Without an OpenAI key, search still works (keyword only, no vector search). With
 
 ### With OpenClaw (recommended)
 
-If you're running OpenClaw, tell it to set up your brain. Make sure your API keys are set in the environment first.
+If you're running OpenClaw, paste this to set up your brain. Make sure your API keys are set in the environment first.
 
 ```
-You: "Install gbrain and set up my knowledge brain.
+You: "Set up gbrain (https://github.com/garrytan/gbrain) as my knowledge brain.
       I need you to:
-      1. Run: bun add gbrain
+      1. Make sure bun is installed (curl -fsSL https://bun.sh/install | bash), then run: bun add gbrain
       2. Run: gbrain init --supabase (follow the wizard to connect my Supabase database)
-      3. Run: gbrain import data/kindling/ (import the demo corpus)
-      4. Read the skill files in skills/ so you know how to use the brain"
+      3. Scan ~/git/ and ~/Documents/ for markdown repos, pick the best one, and run: gbrain import <path>
+      4. Run a query against the imported data to prove search works -- pick the query based on what you imported
+      5. Read https://github.com/garrytan/gbrain/blob/master/docs/GBRAIN_RECOMMENDED_SCHEMA.md and offer to restructure my knowledge base"
 ```
 
-OpenClaw will install the package, walk through the Supabase connection wizard, import demo data, and learn the 7 brain skills (ingest, query, maintain, enrich, briefing, migrate, install).
+OpenClaw will install the package, walk through the Supabase connection wizard, discover your markdown files, import them into Supabase, prove search works with a query from your data, and learn the 7 brain skills (ingest, query, maintain, enrich, briefing, migrate, install).
 
 After setup, you talk to your brain through OpenClaw:
 
 ```
-You: "What essays do we have about startups?"
+You: "Search the brain for everything we know about [topic from your data]"
 You: "Ingest my meeting notes from today"
 You: "Give me a briefing for my meetings tomorrow"
-You: "Import my Obsidian vault into the brain"
+You: "How many pages are in the brain now?"
 ```
 
 OpenClaw reads the skill files in `skills/`, figures out which gbrain commands to run, and does the work. You never touch the CLI directly unless you want to.
@@ -170,8 +195,7 @@ The init wizard:
 1. Checks for Supabase CLI, offers auto-provisioning
 2. Falls back to manual connection URL if CLI isn't available
 3. Runs the full schema migration (tables, indexes, triggers, extensions)
-4. Imports the kindling corpus (10 PG essays) as demo data
-5. Verifies the connection and prints your first query to try
+4. Verifies the connection and confirms the database is ready for import
 
 Config is saved to `~/.gbrain/config.json` with 0600 permissions.
 

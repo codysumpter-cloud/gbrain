@@ -134,14 +134,14 @@ clawhub install gbrain
 #    - If yes: auto-provisions a new Supabase project
 #    - If no: prompts for connection URL
 #    - Runs schema migration
-#    - Imports bundled kindling corpus (10 PG essays)
+#    - Scans for markdown repos and imports user's content
 #    - Shows live entity/edge extraction animation
 #    - Brain is ready
 
 # 3. From OpenClaw, brain tools are now available:
-#    "What essays do we have about startups?"
+#    "Search the brain for [topic from your data]"
 #    "Ingest my meeting notes from today"
-#    "What does PG say about doing things that don't scale?"
+#    "How many pages are in the brain?"
 ```
 
 Behind the scenes, `clawhub install gbrain`:
@@ -164,9 +164,8 @@ gbrain init --supabase
 #   Try 2: If CLI not installed or not logged in, fallback:
 #          "Enter your Supabase connection URL:"
 #   Then: runs schema migration, verifies pgvector extension
-#   Then: imports kindling corpus (10 PG essays as demo data)
-#   Then: shows live entity extraction animation
-#   Output: "Brain ready. 10 pages imported. Try: gbrain query 'what does PG say about startups?'"
+#   Then: verifies database is ready for import
+#   Output: "Brain ready. Run: gbrain import <your-repo>"
 
 # 3. Import your data
 gbrain import /path/to/markdown/wiki/
