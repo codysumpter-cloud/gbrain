@@ -288,8 +288,8 @@ gbrain init --sqlite
 # 2. Run schema (all CREATE TABLE + FTS5 + triggers)
 # 3. Write config to ~/.gbrain/config.json:
 #    { "engine": "sqlite", "database_path": "~/.gbrain/brain.db" }
-# 4. Import kindling corpus (same as Postgres path)
-# 5. "Brain ready. 10 pages imported."
+# 4. Verify database is ready for import
+# 5. "Brain ready. Run: gbrain import <your-repo>"
 ```
 
 No Supabase account needed. No API keys needed (keyword-only mode). No server. Just a file.
