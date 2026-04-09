@@ -552,8 +552,10 @@ export class PostgresEngine implements BrainEngine {
 
 // Helpers
 function validateSlug(slug: string): void {
-  if (!slug || /\.\./.test(slug) || /^\//.test(slug) || !/^[a-z0-9][a-z0-9/_-]*$/.test(slug)) {
-    throw new Error(`Invalid slug: "${slug}". Slugs must be lowercase alphanumeric with / - _ separators, no path traversal.`);
+  // Git is the system of record — slugs are lowercased repo-relative paths.
+  // Only reject empty, path traversal (..), and leading slash.
+  if (!slug || /\.\./.test(slug) || /^\//.test(slug)) {
+    throw new Error(`Invalid slug: "${slug}". Slugs cannot be empty, start with /, or contain path traversal.`);
   }
 }
 
