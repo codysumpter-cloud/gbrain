@@ -1,9 +1,8 @@
 import postgres from 'postgres';
 import { createHash } from 'crypto';
-import { readFileSync } from 'fs';
-import { join, dirname } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { runMigrations } from './migrate.ts';
+import { SCHEMA_SQL } from './schema-embedded.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput,
@@ -58,9 +57,7 @@ export class PostgresEngine implements BrainEngine {
 
   async initSchema(): Promise<void> {
     const conn = this.sql;
-    const schemaPath = join(dirname(new URL(import.meta.url).pathname), '..', 'schema.sql');
-    const schemaSql = readFileSync(schemaPath, 'utf-8');
-    await conn.unsafe(schemaSql);
+    await conn.unsafe(SCHEMA_SQL);
 
     // Run any pending migrations automatically
     const { applied } = await runMigrations(this);

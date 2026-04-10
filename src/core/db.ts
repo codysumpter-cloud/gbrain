@@ -1,7 +1,6 @@
 import postgres from 'postgres';
-import { readFileSync } from 'fs';
-import { join, dirname } from 'path';
 import { GBrainError, type EngineConfig } from './types.ts';
+import { SCHEMA_SQL } from './schema-embedded.ts';
 
 let sql: ReturnType<typeof postgres> | null = null;
 
@@ -61,15 +60,7 @@ export async function disconnect(): Promise<void> {
 
 export async function initSchema(): Promise<void> {
   const conn = getConnection();
-
-  // Read schema SQL and execute as a single statement.
-  // The postgres driver handles multi-statement SQL natively, including
-  // PL/pgSQL functions with $$ delimiter blocks that contain semicolons.
-  // The schema uses IF NOT EXISTS / CREATE OR REPLACE for idempotency.
-  const schemaPath = join(dirname(new URL(import.meta.url).pathname), '..', 'schema.sql');
-  const schemaSql = readFileSync(schemaPath, 'utf-8');
-
-  await conn.unsafe(schemaSql);
+  await conn.unsafe(SCHEMA_SQL);
 }
 
 export async function withTransaction<T>(fn: (tx: ReturnType<typeof postgres>) => Promise<T>): Promise<T> {
