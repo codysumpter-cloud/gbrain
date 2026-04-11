@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 
 import { readFileSync } from 'fs';
-import { PostgresEngine } from './core/postgres-engine.ts';
 import { loadConfig, toEngineConfig } from './core/config.ts';
 import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
@@ -19,7 +18,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'check-update', 'integrations', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'check-update', 'integrations', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate']);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -288,6 +287,11 @@ async function handleCliOnly(command: string, args: string[]) {
         await runDoctor(engine, args);
         break;
       }
+      case 'migrate': {
+        const { runMigrateEngine } = await import('./commands/migrate-engine.ts');
+        await runMigrateEngine(engine, args);
+        break;
+      }
     }
   } finally {
     if (command !== 'serve') await engine.disconnect();
@@ -297,10 +301,11 @@ async function handleCliOnly(command: string, args: string[]) {
 async function connectEngine(): Promise<BrainEngine> {
   const config = loadConfig();
   if (!config) {
-    console.error('No brain configured. Run: gbrain init --supabase');
+    console.error('No brain configured. Run: gbrain init');
     process.exit(1);
   }
-  const engine = new PostgresEngine();
+  const { createEngine } = await import('./core/engine-factory.ts');
+  const engine = await createEngine(toEngineConfig(config));
   await engine.connect(toEngineConfig(config));
   return engine;
 }
@@ -333,7 +338,8 @@ USAGE
   gbrain <command> [options]
 
 SETUP
-  init [--supabase|--url <conn>]     Create brain (guided wizard)
+  init [--pglite|--supabase|--url]   Create brain (PGLite default, no server)
+  migrate --to <supabase|pglite>     Transfer brain between engines
   upgrade                            Self-update
   check-update [--json]              Check for new versions
   doctor [--json]                    Health check (pgvector, RLS, schema, embeddings)

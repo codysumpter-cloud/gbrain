@@ -25,6 +25,14 @@ export async function hybridSearch(
 ): Promise<SearchResult[]> {
   const limit = opts?.limit || 20;
 
+  // Run keyword search (always available, no API key needed)
+  const keywordResults = await engine.searchKeyword(query, { limit: limit * 2 });
+
+  // Skip vector search entirely if no OpenAI key is configured
+  if (!process.env.OPENAI_API_KEY) {
+    return dedupResults(keywordResults).slice(0, limit);
+  }
+
   // Determine query variants (optionally with expansion)
   let queries = [query];
   if (opts?.expansion && opts?.expandFn) {
@@ -36,16 +44,20 @@ export async function hybridSearch(
     }
   }
 
-  // Run keyword search concurrently with embed+vector pipeline
-  const [keywordResults, embeddings] = await Promise.all([
-    engine.searchKeyword(query, { limit: limit * 2 }),
-    Promise.all(queries.map(q => embed(q))),
-  ]);
+  // Embed all query variants and run vector search
+  let vectorLists: SearchResult[][] = [];
+  try {
+    const embeddings = await Promise.all(queries.map(q => embed(q)));
+    vectorLists = await Promise.all(
+      embeddings.map(emb => engine.searchVector(emb, { limit: limit * 2 })),
+    );
+  } catch {
+    // Embedding failure is non-fatal, fall back to keyword-only
+  }
 
-  // Run vector search for each embedding
-  const vectorLists = await Promise.all(
-    embeddings.map(emb => engine.searchVector(emb, { limit: limit * 2 })),
-  );
+  if (vectorLists.length === 0) {
+    return dedupResults(keywordResults).slice(0, limit);
+  }
 
   // Merge all result lists via RRF
   const allLists = [...vectorLists, keywordResults];

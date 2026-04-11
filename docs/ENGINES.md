@@ -4,7 +4,7 @@
 
 Every GBrain operation goes through `BrainEngine`. The engine is the contract between "what the brain can do" and "how it's stored." Swap the engine, keep everything else.
 
-v0 ships `PostgresEngine` backed by Supabase. The interface is designed so a `SQLiteEngine`, `DuckDBEngine`, or `TursoEngine` could slot in without touching the CLI, MCP server, skills, or any consumer code.
+v0 shipped `PostgresEngine` backed by Supabase. v0.7 adds `PGLiteEngine` -- embedded Postgres 17.5 via WASM (@electric-sql/pglite), zero-config default. The interface is designed so a `DuckDBEngine`, `TursoEngine`, or any custom backend could slot in without touching the CLI, MCP server, skills, or any consumer code.
 
 ## Why this matters
 
@@ -12,13 +12,14 @@ Different users have different constraints:
 
 | User | Needs | Best engine |
 |------|-------|-------------|
+| Getting started | Zero-config, no accounts, no server | PGLiteEngine (default since v0.7) |
 | Power user (you) | World-class search, 7K+ pages, zero-ops | PostgresEngine + Supabase |
-| Open source hacker | Single file, no server, git-friendly | SQLiteEngine (future) |
+| Open source hacker | Single file, no server, git-friendly | PGLiteEngine |
 | Team/enterprise | Multi-user, RLS, audit trail | PostgresEngine + self-hosted |
 | Researcher | Analytics, bulk exports, embeddings | DuckDBEngine (someday) |
-| Edge/mobile | Offline-first, sync later | SQLiteEngine + sync (someday) |
+| Edge/mobile | Offline-first, sync later | PGLiteEngine + sync (someday) |
 
-The engine interface means we don't have to choose. Ship Postgres now, let the community build the rest.
+The engine interface means we don't have to choose. PGLite is the zero-friction default. Supabase is the production scale path. `gbrain migrate --to supabase/pglite` moves between them.
 
 ## The interface
 
@@ -82,6 +83,10 @@ export interface BrainEngine {
   // Config
   getConfig(key: string): Promise<string | null>;
   setConfig(key: string, value: string): Promise<void>;
+
+  // Migration + advanced (added v0.7)
+  runMigration(sql: string): Promise<void>;
+  getChunksWithEmbeddings(slug: string): Promise<ChunkWithEmbedding[]>;
 }
 ```
 
@@ -116,11 +121,11 @@ export interface BrainEngine {
         +-----------+-----------+   +---------+---------+
         |                       |   |                   |
 +-------v-------+  +-------v---+   +-------v---+  +----v--------+
-| Postgres:     |  | SQLite:   |   | Postgres: |  | SQLite:     |
-| tsvector +    |  | FTS5 +    |   | pgvector  |  | sqlite-vss  |
-| ts_rank +     |  | bm25      |   | HNSW      |  | or vec0     |
-| websearch_to_ |  |           |   | cosine    |  |             |
-| tsquery       |  |           |   |           |  |             |
+| Postgres:     |  | PGLite:   |   | Postgres: |  | PGLite:     |
+| tsvector +    |  | tsvector +|   | pgvector  |  | pgvector    |
+| ts_rank +     |  | ts_rank   |   | HNSW      |  | HNSW        |
+| websearch_to_ |  | (same SQL)|   | cosine    |  | cosine      |
+| tsquery       |  |           |   |           |  | (same SQL)  |
 +---------------+  +-----------+   +-----------+  +-------------+
 ```
 
@@ -143,20 +148,50 @@ RRF fusion, multi-query expansion, and 4-layer dedup are engine-agnostic. They o
 
 **Why not self-hosted for v0:** The brain should be infrastructure agents use, not something you maintain. Self-hosted Postgres with Docker is a welcome community PR, but v0 optimizes for zero ops.
 
+## PGLiteEngine (v0.7, ships)
+
+**Dependencies:** `@electric-sql/pglite` (v0.4.4+)
+
+**What it is:** Embedded Postgres 17.5 compiled to WASM via ElectricSQL's PGLite. Runs in-process, no server, no Docker, no accounts. Same SQL as PostgresEngine -- not a separate dialect. All 37 BrainEngine methods implemented.
+
+**PGLite-specific details:**
+- Uses `pglite-schema.ts` for DDL (pgvector extension, pg_trgm, triggers, indexes)
+- Parameterized queries throughout (shared utilities in `src/core/utils.ts`)
+- `hybridSearch` keyword-only fallback when `OPENAI_API_KEY` is not set
+- Data stored at `~/.gbrain/brain.db` (configurable)
+- pgvector HNSW index for cosine similarity vector search (same as Postgres)
+- tsvector + ts_rank for full-text search (same as Postgres)
+- pg_trgm for fuzzy slug resolution (same as Postgres)
+
+**When to use PGLite vs Postgres:**
+
+| Factor | PGLite | PostgresEngine + Supabase |
+|--------|--------|--------------------------|
+| Setup | `gbrain init` (zero-config) | Account + connection string |
+| Scale | Good for < 1,000 files | Production-proven at 10K+ |
+| Multi-device | Single machine only | Any device via remote MCP |
+| Cost | Free | Supabase Pro ($25/mo) |
+| Concurrency | Single process | Connection pooling |
+| Backups | Manual (file copy) | Managed by Supabase |
+
+**Migration:** `gbrain migrate --to supabase` exports everything (pages, chunks, embeddings, links, tags, timeline) and imports into Supabase. `gbrain migrate --to pglite` goes the other direction. Bidirectional, lossless.
+
 ## Adding a new engine
 
 1. Create `src/core/<name>-engine.ts` implementing `BrainEngine`
-2. Add to engine factory in `src/core/engine.ts`:
+2. Add to engine factory in `src/core/engine-factory.ts`:
    ```typescript
    export function createEngine(type: string): BrainEngine {
      switch (type) {
+       case 'pglite': return new PGLiteEngine();
        case 'postgres': return new PostgresEngine();
-       case 'sqlite': return new SQLiteEngine();
+       case 'myengine': return new MyEngine();
        default: throw new Error(`Unknown engine: ${type}`);
      }
    }
    ```
-3. Store engine type in `~/.gbrain/config.json`: `{ "engine": "sqlite", ... }`
+   The factory uses dynamic imports so engines are only loaded when selected.
+3. Store engine type in `~/.gbrain/config.json`: `{ "engine": "myengine", ... }`
 4. Add tests. The test suite should be engine-agnostic where possible... same test cases, different engine constructor.
 5. Document in this file + add a design doc in `docs/`
 
@@ -175,24 +210,25 @@ Every method in `BrainEngine`. The full interface. No optional methods, no featu
 
 ## Capability matrix
 
-| Capability | PostgresEngine | SQLiteEngine (future) | Notes |
-|-----------|---------------|----------------------|-------|
-| CRUD | Full | Full | |
-| Keyword search | tsvector + ts_rank | FTS5 + bm25 | Different ranking algorithms |
-| Vector search | pgvector HNSW | sqlite-vss or vec0 | Different index types |
-| Fuzzy slug | pg_trgm | LIKE + Levenshtein | Postgres is better here |
-| Graph traversal | Recursive CTE | Loop with depth tracking | Same interface |
+| Capability | PostgresEngine | PGLiteEngine | Notes |
+|-----------|---------------|-------------|-------|
+| CRUD | Full | Full | Same SQL |
+| Keyword search | tsvector + ts_rank | tsvector + ts_rank | Identical (real Postgres) |
+| Vector search | pgvector HNSW | pgvector HNSW | Identical (real Postgres) |
+| Fuzzy slug | pg_trgm | pg_trgm | Identical (real Postgres) |
+| Graph traversal | Recursive CTE | Recursive CTE | Same SQL |
 | Transactions | Full ACID | Full ACID | Both support this |
-| JSONB queries | GIN index | json_extract | Postgres is richer |
-| Concurrent access | Connection pooling | Single writer | SQLite limitation |
+| JSONB queries | GIN index | GIN index | Identical |
+| Concurrent access | Connection pooling | Single process | PGLite limitation |
 | Hosting | Supabase, self-hosted, Docker | Local file | |
+| Migration methods | runMigration, getChunksWithEmbeddings | Same | Added v0.7 |
 
 ## Future engine ideas
-
-**SQLiteEngine** (most requested). See `docs/SQLITE_ENGINE.md` for the full plan. Single file, no server, git-friendly. Uses FTS5 for keyword search, sqlite-vss or vec0 for vector search. Great for open source users who want zero infrastructure.
 
 **TursoEngine.** libSQL (SQLite fork) with embedded replicas and HTTP edge access. Would give SQLite's simplicity with cloud sync. Interesting for mobile/edge use cases.
 
 **DuckDBEngine.** Analytical workloads. Bulk exports, embedding analysis, brain-wide statistics. Not for OLTP. Could be a secondary engine for analytics alongside Postgres for operations.
 
 **Custom/Remote.** The interface is clean enough that someone could build an engine backed by any storage: Firestore, DynamoDB, a REST API, even a flat file system. The interface doesn't assume SQL.
+
+Note: The original SQLite engine plan (`docs/SQLITE_ENGINE.md`) was superseded by PGLite. PGLite uses the same SQL as Postgres, eliminating the need for a separate SQLite dialect with FTS5/sqlite-vss translation.

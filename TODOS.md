@@ -19,6 +19,19 @@
 
 ## P0
 
+### Fix `bun build --compile` WASM embedding for PGLite
+**What:** Submit PR to oven-sh/bun fixing WASM file embedding in `bun build --compile` (issue oven-sh/bun#15032).
+
+**Why:** PGLite's WASM files (~3MB) can't be embedded in the compiled binary. Users who install via `bun install -g gbrain` are fine (WASM resolves from node_modules), but the compiled binary can't use PGLite. Jarred Sumner (Bun founder, YC W22) would likely be receptive.
+
+**Pros:** Single-binary distribution includes PGLite. No sidecar files needed.
+
+**Cons:** Requires understanding Bun's bundler internals. May be a large PR.
+
+**Context:** Issue has been open since Nov 2024. The root cause is that `bun build --compile` generates virtual filesystem paths (`/$bunfs/root/...`) that PGLite can't resolve. Multiple users have reported this. A fix would benefit any WASM-dependent package, not just PGLite.
+
+**Depends on:** PGLite engine shipping (to have a real use case for the PR).
+
 ### ChatGPT MCP support (OAuth 2.1)
 **What:** Add OAuth 2.1 with Dynamic Client Registration to the Edge Function so ChatGPT can connect.
 

@@ -2,16 +2,39 @@
 
 Your AI agent is smart but it doesn't know anything about your life. GBrain fixes that. Meetings, emails, tweets, calendar events, voice calls, original ideas... all of it flows into a searchable knowledge base that your agent reads before every response and writes to after every conversation. The agent gets smarter every day.
 
+> **~30 minutes to a fully working brain.** Your agent does the work. Database ready in 2 seconds (PGLite, no server). Schema, import, embeddings, and integrations take 15-30 minutes depending on brain size. You just answer questions about API keys.
+>
 > **Requires a frontier model.** Tested with **Claude Opus 4.6** and **GPT-5.4 Thinking**. Likely to break with smaller models.
+
+## Need an AI agent first?
+
+GBrain is designed to be installed and operated by an AI agent. If you don't have one running yet:
+
+- **[OpenClaw](https://openclaw.ai)** — Deploy [AlphaClaw on Render](https://render.com/deploy?repo=https://github.com/openclaw/alphaclaw) (one click, requires 8GB+ RAM instance)
+- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** — Deploy on [Railway using this template](https://github.com/praveen-ks-2001/hermes-agent-template) (one click)
+- **[Claude Code](https://claude.ai/code)** — Already installed? Paste the block below directly into your terminal
 
 ## Start here: paste this into your agent
 
-Copy this block into [OpenClaw](https://openclaw.ai) or [Hermes Agent](https://github.com/NousResearch/hermes-agent). The agent will install GBrain, set up your database, import your files, and verify everything works.
+Copy this block into OpenClaw, Hermes Agent, or Claude Code. The agent will install GBrain, set up the brain schema, import your files, configure all integrations, and verify everything works.
 
 ```
-GOAL: Install GBrain so I can search my own markdown files with
-hybrid search (keyword + vector). Do not skip steps. Verify each
-step before proceeding. If a step fails, stop and fix it.
+GOAL: I want Garry Tan's exact opinionated AI agent setup. Get me
+there. Install GBrain, set up the brain schema, import my files,
+configure all integrations, and verify everything works. Do not skip
+steps. Verify each step before proceeding. If a step fails, stop
+and fix it.
+
+You don't need a server to start. gbrain init defaults to PGLite
+(embedded Postgres 17.5 via WASM). No Supabase account, no Docker,
+no connection strings. One command and you have a full Postgres brain
+with pgvector, hybrid search, and all 37 operations. When your brain
+outgrows local (1000+ files), gbrain migrate --to supabase moves
+everything to managed Postgres in one shot.
+
+The knowledge model is markdown files in a git repo. Read
+docs/GBRAIN_SKILLPACK.md for the full agent playbook and
+docs/GBRAIN_RECOMMENDED_SCHEMA.md for the brain directory structure.
 
 STEP 1 — INSTALL
   curl -fsSL https://bun.sh/install | bash && source ~/.bashrc
@@ -19,46 +42,63 @@ STEP 1 — INSTALL
   Verify: gbrain --version
 
 STEP 2 — DATABASE
-  Run: gbrain init --supabase
-  Ask the user for their Supabase Shared Pooler connection string:
-    "Go to https://supabase.com → your project → Get Connected →
-     Direct Connection String → Session Pooler → copy Shared Pooler"
-  Do NOT ask for the anon key or project URL. Those are wrong.
+  Run: gbrain init
+  This creates a local PGLite brain (embedded Postgres, no server).
+  Brain ready in ~2 seconds. No accounts, no connection strings.
   Verify: gbrain doctor --json (all checks pass)
 
-STEP 3 — IMPORT
+  For large brains (1000+ files) or remote access, use Supabase:
+    gbrain init --supabase
+  You can migrate anytime: gbrain migrate --to supabase
+
+STEP 3 — SCHEMA
+  Read docs/GBRAIN_RECOMMENDED_SCHEMA.md — this is the brain's directory
+  structure. Set up the MECE directories (people/, companies/, deals/,
+  concepts/, etc.) with README.md resolvers in each. The schema tells
+  you exactly what goes where and how to resolve ambiguity.
+  The agent maintains this structure automatically after setup.
+
+STEP 4 — IMPORT
   Find markdown: find ~/git ~/Documents ~/notes -maxdepth 3 -name "*.md" | head -30
   Tell user what you found. Import: gbrain import /path/ --no-embed
   Verify: gbrain stats (page count > 0)
 
-STEP 4 — SEARCH
+STEP 5 — SEARCH
   Run: gbrain embed --stale (generates vector embeddings, ~1 min per 1000 pages)
   Then: gbrain query "what are the key themes across these documents?"
   Show the user the results. This is the magic moment.
   Verify: results include semantic matches, not just keyword hits
 
-STEP 5 — GO LIVE
+STEP 6 — GO LIVE
   a. Read docs/GBRAIN_SKILLPACK.md — adopt brain-first lookup, entity
      detection, and back-linking into your behavior immediately
   b. Set up live sync: gbrain sync --repo /path/ && gbrain embed --stale
      (see docs/guides/live-sync.md for cron/watch/webhook options)
   c. Set up auto-update: gbrain check-update --json on a daily cron
      (never auto-install — always ask the user first)
-  d. Show available integrations: gbrain integrations
-  e. Run verification: read and execute docs/GBRAIN_VERIFY.md
+  d. Run verification: read and execute docs/GBRAIN_VERIFY.md
+
+STEP 7 — INTEGRATIONS
+  Run: gbrain integrations list
+  For EVERY available recipe, set it up. Each recipe is a markdown file
+  that tells the agent exactly what credentials to ask for, how to
+  validate them, and how to wire the integration. The agent reads the
+  recipe, asks the user for API keys, and handles the rest.
+  Voice, email, calendar, Twitter — install them all.
+  Verify: gbrain integrations doctor (all health checks pass)
 
 DONE. Tell the user: "GBrain is live. You have [N] pages with hybrid
-search. I now check the brain before answering questions. Run
-'gbrain integrations' to add voice, email, calendar, or Twitter."
+search. I now check the brain before answering questions. All available
+integrations are configured."
 ```
 
 ### Without an agent (standalone CLI)
 
 ```bash
 bun add -g github:garrytan/gbrain
-gbrain init --supabase          # guided wizard
+gbrain init                     # local brain, ready in 2 seconds
 gbrain import ~/git/brain/      # index your markdown
-gbrain query "what do we know about competitive dynamics?"
+gbrain query "what themes show up across my notes?"
 ```
 
 Run `gbrain --help` for all commands. See [MCP setup](docs/mcp/DEPLOY.md) for connecting Claude Desktop, Perplexity, etc.
@@ -111,9 +151,7 @@ I was setting up my [OpenClaw](https://openclaw.ai) agent and started a markdown
 
 The agent runs while I sleep. The dream cycle scans every conversation, enriches missing entities, fixes broken citations, and consolidates memory. I wake up and the brain is smarter than when I went to sleep. See the [cron schedule guide](docs/guides/cron-schedule.md) for setup.
 
-**You don't need Postgres to start.** The knowledge model is just markdown files in a git repo. The [skills](docs/GBRAIN_SKILLPACK.md) and [schema](docs/GBRAIN_RECOMMENDED_SCHEMA.md) work with any AI agent that can read and write files.
-
-**When you need Postgres:** at 1,000+ files, `grep` stops working. GBrain adds hybrid search (keyword + vector + RRF fusion) on top of Postgres + pgvector. The CLI and MCP layer handle chunking, embedding, and incremental sync. Add Postgres when search speed matters, or when you want Claude Desktop, ChatGPT, Perplexity, or other MCP clients to connect to your brain remotely.
+**PGLite runs locally by default.** `gbrain init` gives you embedded Postgres with pgvector, hybrid search, and all 37 operations. No server, no subscription. When your brain outgrows local (1000+ files, multi-device access, remote MCP), `gbrain migrate --to supabase` moves everything to managed Postgres.
 
 ## Architecture
 
@@ -166,53 +204,151 @@ They're complementary:
 
 All three should be checked. GBrain for facts about the world. Memory for agent config. Session for immediate context. Install via `openclaw skills install gbrain`.
 
-## Try it: your files, searchable in 90 seconds
+## The compounding effect
 
-GBrain doesn't ship with demo data. It finds YOUR markdown and makes it searchable.
+The real value isn't search. It's what happens after a few weeks of use.
 
-**Act 1: Discovery.** GBrain scans your machine for markdown repos.
+You take a meeting with someone. The agent writes a brain page for them, links it to their company, tags it with the deal. Next week someone mentions that company in a different context. The agent already has the full picture: who you talked to, what you discussed, what threads are open. You didn't do anything. The brain already had it.
 
-```
-=== GBrain Environment Discovery ===
+## Install
 
-  ~/git/brain (2.3GB, 342 .md files, 87 binary files)
-    Type: Plain markdown (ready for import)
+### Prerequisites
 
-  ~/Documents/obsidian-vault (180MB, 1,203 .md files, 0 binary files)
-    Type: Obsidian vault (wikilink conversion available)
+**Zero-config start (PGLite).** `gbrain init` creates a local embedded Postgres brain. No accounts, no server, no API keys. Keyword search works immediately. Add API keys later for vector search and LLM-powered features.
 
-=== Discovery Complete ===
-```
+**For production scale (Supabase).** When your brain outgrows local, `gbrain migrate --to supabase` moves everything to managed Postgres:
 
-**Act 2: Import.** Your files move from the repo into Supabase.
+| Dependency | What it's for | How to get it |
+|------------|--------------|---------------|
+| **Supabase account** | Postgres + pgvector database | [supabase.com](https://supabase.com) (Pro tier, $25/mo for 8GB) |
+| **OpenAI API key** | Embeddings (text-embedding-3-large) | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| **Anthropic API key** | Multi-query expansion + LLM chunking (Haiku) | [console.anthropic.com](https://console.anthropic.com) |
 
-```bash
-gbrain import ~/git/brain/
-# Imported 342 files into Supabase (1,847 chunks). Embedding in background...
-
-gbrain stats
-# Pages: 342, Chunks: 1,847, Embedded: 0 (embedding...), Links: 0
-```
-
-**Act 3: Search.** The agent picks a query from your actual content.
+Set the API keys as environment variables:
 
 ```bash
-# The agent reads your corpus and picks a relevant query
-gbrain query "what do we know about competitive dynamics?"
-# 3 results, scored by hybrid search (vector + keyword + RRF fusion)
-
-# 30 seconds later, embeddings finish:
-gbrain stats
-# Pages: 342, Chunks: 1,847, Embedded: 1,847, Links: 0
-
-# Now semantic search is live too
-gbrain query "what are our biggest risks right now?"
-# Finds pages about moats, board prep, and strategy -- by meaning, not keywords
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Your file count will be different. Your queries will be different. The agent picks them based on what it imported. That's the point: this is YOUR brain, not a demo.
+The Supabase connection URL is configured during `gbrain init --supabase`. The OpenAI and Anthropic SDKs read their keys from the environment automatically.
 
-**The compounding effect.** Search for Pedro. The agent pulls his page, his relationship history, his company. Next time Brex comes up in conversation, the agent already knows Pedro co-founded it, what you discussed last, and what's on your open threads. You didn't do anything — the brain already had it.
+Without an OpenAI key, search still works (keyword only, no vector search). Without an Anthropic key, search still works (no multi-query expansion, no LLM chunking).
+
+### GBrain without OpenClaw
+
+GBrain works with any AI agent, any MCP client, or no agent at all. Three paths:
+
+#### Standalone CLI
+
+Install globally and use gbrain from the terminal:
+
+```bash
+bun add -g github:garrytan/gbrain
+gbrain init                     # PGLite (local, no server needed)
+gbrain import ~/git/brain/      # index your markdown
+gbrain query "what themes show up across my notes?"
+```
+
+Run `gbrain --help` for the full list of commands.
+
+#### MCP server (Claude Code, Cursor, Windsurf, etc.)
+
+GBrain exposes 30 MCP tools via stdio. Add this to your MCP client config:
+
+**Claude Code** (`~/.claude/server.json`):
+```json
+{
+  "mcpServers": {
+    "gbrain": {
+      "command": "gbrain",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+**Cursor** (Settings > MCP Servers):
+```json
+{
+  "gbrain": {
+    "command": "gbrain",
+    "args": ["serve"]
+  }
+}
+```
+
+This gives your agent `get_page`, `put_page`, `search`, `query`, `add_link`, `traverse_graph`, `sync_brain`, `file_upload`, and 22 more tools. All generated from the same operation definitions as the CLI.
+
+#### Remote MCP Server (Claude Desktop, Cowork, Perplexity, ChatGPT)
+
+Access your brain from any device, any AI client. Deploy as a serverless endpoint on your existing Supabase instance:
+
+```bash
+cp .env.production.example .env.production   # fill in 3 values
+bash scripts/deploy-remote.sh                 # links, builds, deploys
+bun run src/commands/auth.ts create "claude-desktop"  # get a token
+```
+
+Then add to your AI client:
+- **Claude Code:** `claude mcp add gbrain -t http https://YOUR_REF.supabase.co/functions/v1/gbrain-mcp/mcp -H "Authorization: Bearer TOKEN"`
+- **Claude Desktop:** Settings > Integrations > Add (NOT JSON config)
+- **Perplexity Computer:** Settings > Connectors > Add remote MCP
+
+Per-client setup guides: [`docs/mcp/`](docs/mcp/DEPLOY.md)
+
+ChatGPT support requires OAuth 2.1 (not yet implemented). Self-hosted alternatives (Tailscale Funnel, ngrok) documented in [`docs/mcp/ALTERNATIVES.md`](docs/mcp/ALTERNATIVES.md).
+
+**The tools are not enough.** Your agent also needs the playbook: read [GBRAIN_SKILLPACK.md](docs/GBRAIN_SKILLPACK.md) and paste the relevant sections into your agent's system prompt or project instructions. The skillpack tells the agent WHEN and HOW to use each tool: read before responding, write after learning, detect entities on every message, back-link everything.
+
+The skill markdown files in `skills/` are standalone instruction sets. Copy them into your agent's context:
+
+| Skill file | What the agent learns |
+|------------|----------------------|
+| `skills/ingest/SKILL.md` | How to import meetings, docs, articles |
+| `skills/query/SKILL.md` | 3-layer search with synthesis and citations |
+| `skills/maintain/SKILL.md` | Periodic health: stale pages, orphans, dead links |
+| `skills/enrich/SKILL.md` | Enrich pages from external APIs |
+| `skills/briefing/SKILL.md` | Daily briefing with meeting prep |
+| `skills/migrate/SKILL.md` | Migrate from Obsidian, Notion, Logseq, etc. |
+
+#### As a TypeScript library
+
+```bash
+bun add github:garrytan/gbrain
+```
+
+```typescript
+import { createEngine } from 'gbrain';
+
+// PGLite (local, no server)
+const engine = createEngine('pglite');
+await engine.connect({ database_path: '~/.gbrain/brain.pglite' });
+await engine.initSchema();
+
+// Or Postgres (Supabase / self-hosted)
+// const engine = createEngine('postgres');
+// await engine.connect({ database_url: process.env.DATABASE_URL });
+// await engine.initSchema();
+
+// Search
+const results = await engine.searchKeyword('startup growth');
+
+// Read
+const page = await engine.getPage('people/pedro-franceschi');
+
+// Write
+await engine.putPage('concepts/superlinear-returns', {
+  type: 'concept',
+  title: 'Superlinear Returns',
+  compiled_truth: 'Paul Graham argues that returns in many fields are superlinear...',
+  timeline: '- 2023-10-01: Published on paulgraham.com',
+});
+```
+
+The `BrainEngine` interface is pluggable. `createEngine()` accepts `'pglite'` or `'postgres'`. See `docs/ENGINES.md` for details.
+
+PGLite (default) requires no external database. For production scale (7K+ pages, multi-device, remote MCP), use Supabase Pro ($25/mo).
 
 ## Upgrade
 
@@ -231,42 +367,17 @@ clawhub update gbrain
 
 After upgrading, run `gbrain init` again to apply any schema migrations (idempotent, safe to re-run).
 
-## Setup
+## Setup details
 
-After installing via CLI or library path, run the setup wizard:
-
-```bash
-# Guided wizard: auto-provisions Supabase or accepts a connection URL
-gbrain init --supabase
-
-# Or connect to any Postgres with pgvector
-gbrain init --url postgresql://user:pass@host:5432/dbname
-```
-
-The init wizard:
-1. Checks for Supabase CLI, offers auto-provisioning
-2. Falls back to manual connection URL if CLI isn't available
-3. Runs the full schema migration (tables, indexes, triggers, extensions)
-4. Verifies the connection and confirms the database is ready for import
-
-Config is saved to `~/.gbrain/config.json` with 0600 permissions.
-
-OpenClaw users skip this step. The orchestrator runs the wizard for you during install.
-
-## First import
+`gbrain init` defaults to PGLite (embedded Postgres 17.5 via WASM). No accounts, no server. Config saved to `~/.gbrain/config.json`.
 
 ```bash
-# Import your markdown wiki (auto-chunks and auto-embeds)
-gbrain import /path/to/brain/
-
-# Skip embedding if you want to import fast and embed later
-gbrain import /path/to/brain/ --no-embed
-
-# Backfill embeddings for pages that don't have them
-gbrain embed --stale
+gbrain init                     # PGLite (default)
+gbrain init --supabase          # guided wizard for Supabase
+gbrain init --url <conn>        # any Postgres with pgvector
 ```
 
-Import is idempotent. Re-running it skips unchanged files (compared by SHA-256 content hash). Progress bar shows status. ~30s for text import of 7,000 files, ~10-15 min for embedding.
+Import is idempotent. Re-running skips unchanged files (SHA-256 content hash). ~30s for text import of 7,000 files, ~10-15 min for embedding.
 
 ## File storage and migration
 
@@ -442,7 +553,8 @@ Three strategies, dispatched by content type:
 
 ```
 SETUP
-  gbrain init [--supabase|--url <conn>]     Create brain (guided wizard)
+  gbrain init [--supabase|--url <conn>]     Create brain (PGLite default, or Supabase)
+  gbrain migrate --to supabase|pglite       Migrate between engines (bidirectional)
   gbrain upgrade                            Self-update
 
 PAGES
@@ -527,17 +639,24 @@ CLI / MCP Server
       BrainEngine interface
        (pluggable backend)
               |
+      engine-factory.ts
+       (dynamic imports)
+              |
      +--------+--------+
      |                  |
-PostgresEngine     SQLiteEngine
-  (ships v0)       (designed, community PRs welcome)
-     |
-Supabase Pro ($25/mo)
-  Postgres + pgvector + pg_trgm
-  connection pooling via Supavisor
+PGLiteEngine       PostgresEngine
+  (ships v0.7)       (ships v0)
+     |                  |
+~/.gbrain/brain.pglite  Supabase Pro ($25/mo)
+  embedded PG 17.5    Postgres + pgvector + pg_trgm
+  via @electric-sql    connection pooling via Supavisor
+  /pglite
+
+     gbrain migrate --to supabase/pglite
+         (bidirectional migration)
 ```
 
-Embedding, chunking, and search fusion are engine-agnostic. Only raw keyword search (`searchKeyword`) and raw vector search (`searchVector`) are engine-specific. RRF fusion, multi-query expansion, and 4-layer dedup run above the engine on `SearchResult[]` arrays.
+Embedding, chunking, and search fusion are engine-agnostic. Only raw keyword search (`searchKeyword`) and raw vector search (`searchVector`) are engine-specific. RRF fusion, multi-query expansion, and 4-layer dedup run above the engine on `SearchResult[]` arrays. Both engines use the same SQL (PGLite runs real Postgres, not a separate dialect).
 
 ## Storage estimates
 
@@ -573,8 +692,7 @@ Initial embedding cost: ~$4-5 for 7,500 pages via OpenAI text-embedding-3-large.
 
 **Reference:**
 - [GBRAIN_V0.md](docs/GBRAIN_V0.md) -- Full product spec, all architecture decisions
-- [ENGINES.md](docs/ENGINES.md) -- Pluggable engine interface, how to add backends
-- [SQLITE_ENGINE.md](docs/SQLITE_ENGINE.md) -- SQLite engine plan (community PRs welcome)
+- [ENGINES.md](docs/ENGINES.md) -- Pluggable engine interface: PGLite (default) + Postgres, capability matrix, migration
 
 ## Contributing
 
@@ -584,10 +702,10 @@ against real Postgres+pgvector: `docker compose -f docker-compose.test.yml up -d
 
 Welcome PRs for:
 
-- SQLite engine implementation
 - New enrichment API integrations
 - Performance optimizations
 - Docker Compose for self-hosted Postgres
+- Additional engine backends (DuckDB, Turso, etc.)
 
 ## License
 

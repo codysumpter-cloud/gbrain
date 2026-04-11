@@ -98,11 +98,7 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
       // SQL migration (transactional)
       if (m.sql) {
         await engine.transaction(async (tx) => {
-          const eng = tx as any;
-          const sql = eng.sql || eng._sql;
-          if (sql) {
-            await sql.unsafe(m.sql);
-          }
+          await tx.runMigration(m.version, m.sql);
         });
       }
 

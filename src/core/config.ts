@@ -8,7 +8,7 @@ function getConfigDir() { return join(homedir(), '.gbrain'); }
 function getConfigPath() { return join(getConfigDir(), 'config.json'); }
 
 export interface GBrainConfig {
-  engine: 'postgres' | 'sqlite';
+  engine: 'postgres' | 'pglite';
   database_url?: string;
   database_path?: string;
   openai_api_key?: string;
@@ -31,13 +31,18 @@ export function loadConfig(): GBrainConfig | null {
 
   if (!fileConfig && !dbUrl) return null;
 
+  // Infer engine type if not explicitly set
+  const inferredEngine: 'postgres' | 'pglite' = fileConfig?.engine
+    || (fileConfig?.database_path ? 'pglite' : 'postgres');
+
   // Merge: env vars override config file
-  return {
-    engine: 'postgres',
+  const merged = {
     ...fileConfig,
+    engine: inferredEngine,
     ...(dbUrl ? { database_url: dbUrl } : {}),
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
   };
+  return merged as GBrainConfig;
 }
 
 export function saveConfig(config: GBrainConfig): void {

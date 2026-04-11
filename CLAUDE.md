@@ -1,19 +1,27 @@
 # CLAUDE.md
 
-GBrain is a personal knowledge brain. Postgres + pgvector + hybrid search in a managed Supabase instance.
+GBrain is a personal knowledge brain. Pluggable engines: PGLite (embedded Postgres
+via WASM, zero-config default) or Postgres + pgvector + hybrid search in a managed
+Supabase instance. `gbrain init` defaults to PGLite; suggests Supabase for 1000+ files.
 
 ## Architecture
 
 Contract-first: `src/core/operations.ts` defines ~30 shared operations. CLI and MCP
-server are both generated from this single source. Skills are fat markdown files
-(tool-agnostic, work with both CLI and plugin contexts).
+server are both generated from this single source. Engine factory (`src/core/engine-factory.ts`)
+dynamically imports the configured engine (`'pglite'` or `'postgres'`). Skills are fat
+markdown files (tool-agnostic, work with both CLI and plugin contexts).
 
 ## Key files
 
 - `src/core/operations.ts` — Contract-first operation definitions (the foundation)
 - `src/core/engine.ts` — Pluggable engine interface (BrainEngine)
-- `src/core/postgres-engine.ts` — Postgres + pgvector implementation
+- `src/core/engine-factory.ts` — Engine factory with dynamic imports (`'pglite'` | `'postgres'`)
+- `src/core/pglite-engine.ts` — PGLite (embedded Postgres 17.5 via WASM) implementation, all 37 BrainEngine methods
+- `src/core/pglite-schema.ts` — PGLite-specific DDL (pgvector, pg_trgm, triggers)
+- `src/core/postgres-engine.ts` — Postgres + pgvector implementation (Supabase / self-hosted)
+- `src/core/utils.ts` — Shared SQL utilities extracted from postgres-engine.ts
 - `src/core/db.ts` — Connection management, schema initialization
+- `src/commands/migrate-engine.ts` — Bidirectional engine migration (`gbrain migrate --to supabase/pglite`)
 - `src/core/import-file.ts` — importFromFile + importFromContent (chunk + embed + tags)
 - `src/core/sync.ts` — Pure sync functions (manifest parsing, filtering, slug conversion)
 - `src/core/storage.ts` — Pluggable storage interface (S3, Supabase Storage, local)
@@ -50,9 +58,13 @@ server are both generated from this single source. Skills are fat markdown files
 
 Run `gbrain --help` or `gbrain --tools-json` for full command reference.
 
+Key commands added in v0.7:
+- `gbrain init` — defaults to PGLite (no Supabase needed), scans repo size, suggests Supabase for 1000+ files
+- `gbrain migrate --to supabase` / `gbrain migrate --to pglite` — bidirectional engine migration
+
 ## Testing
 
-`bun test` runs all tests (20 unit test files + 4 E2E test files). Unit tests run
+`bun test` runs all tests (23 unit test files + 4 E2E test files). Unit tests run
 without a database. E2E tests skip gracefully when `DATABASE_URL` is not set.
 
 Unit tests: `test/markdown.test.ts` (frontmatter parsing), `test/chunkers/recursive.test.ts`
@@ -65,6 +77,8 @@ parity), `test/cli.test.ts` (CLI structure), `test/config.test.ts` (config redac
 `test/setup-branching.test.ts` (setup flow), `test/slug-validation.test.ts` (slug validation),
 `test/storage.test.ts` (storage backends), `test/supabase-admin.test.ts` (Supabase admin),
 `test/yaml-lite.test.ts` (YAML parsing), `test/check-update.test.ts` (version check + update CLI),
+`test/pglite-engine.test.ts` (PGLite engine, all 37 BrainEngine methods),
+`test/utils.test.ts` (shared SQL utilities), `test/engine-factory.test.ts` (engine factory + dynamic imports),
 `test/integrations.test.ts` (recipe parsing, CLI routing, recipe validation).
 
 E2E tests (`test/e2e/`): Run against real Postgres+pgvector. Require `DATABASE_URL`.

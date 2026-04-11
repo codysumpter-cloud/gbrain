@@ -74,4 +74,8 @@ export interface BrainEngine {
   // Config
   getConfig(key: string): Promise<string | null>;
   setConfig(key: string, value: string): Promise<void>;
+
+  // Migration support
+  runMigration(version: number, sql: string): Promise<void>;
+  getChunksWithEmbeddings(slug: string): Promise<Chunk[]>;
 }

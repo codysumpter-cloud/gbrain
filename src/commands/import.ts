@@ -3,7 +3,6 @@ import { execFileSync } from 'child_process';
 import { join, relative } from 'path';
 import { cpus, totalmem, homedir } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
-import { PostgresEngine } from '../core/postgres-engine.ts';
 import { importFile } from '../core/import-file.ts';
 import { loadConfig } from '../core/config.ts';
 
@@ -127,11 +126,19 @@ export async function runImport(engine: BrainEngine, args: string[]) {
 
   if (actualWorkers > 1) {
     // Parallel: create per-worker engine instances with small pool
+    // PGLite is single-connection, so parallel workers are only for Postgres
     const config = loadConfig();
+    if (config?.engine === 'pglite') {
+      // PGLite: sequential import through single engine
+      for (const file of files) {
+        await processFile(engine, file);
+      }
+    } else {
+    const { PostgresEngine } = await import('../core/postgres-engine.ts');
     const workerEngines = await Promise.all(
       Array.from({ length: actualWorkers }, async () => {
         const eng = new PostgresEngine();
-        await eng.connect({ database_url: config.database_url!, poolSize: 2 });
+        await eng.connect({ database_url: config!.database_url!, poolSize: 2 });
         return eng;
       })
     );
@@ -147,6 +154,7 @@ export async function runImport(engine: BrainEngine, args: string[]) {
     }));
 
     await Promise.all(workerEngines.map(e => e.disconnect()));
+    } // end else (postgres parallel)
   } else {
     // Sequential: use the provided engine
     for (const filePath of files) {
