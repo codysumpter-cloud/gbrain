@@ -50,6 +50,7 @@ markdown files (tool-agnostic, work with both CLI and plugin contexts).
 - `docs/guides/diligence-ingestion.md` — Data room to brain pages pipeline
 - `docs/designs/HOMEBREW_FOR_PERSONAL_AI.md` — 10-star vision for integration system
 - `docs/mcp/` — Per-client setup guides (Claude Desktop, Code, Cowork, Perplexity)
+- `skills/_brain-filing-rules.md` — Cross-cutting brain filing rules (referenced by all brain-writing skills)
 - `skills/migrations/` — Version migration files with feature_pitch YAML frontmatter
 - `openclaw.plugin.json` — ClawHub bundle plugin manifest
 
