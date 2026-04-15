@@ -1,7 +1,11 @@
 import { execSync } from 'child_process';
-import { readdirSync, lstatSync, existsSync, copyFileSync, mkdirSync } from 'fs';
+import { readdirSync, lstatSync, existsSync, copyFileSync, mkdirSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { homedir } from 'os';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 import { saveConfig, type GBrainConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 
@@ -170,7 +174,7 @@ function countMarkdownFiles(dir: string, maxScan = 1500): number {
         try {
           let stat;
           try {
-            stat = llstatSync(full);
+            stat = lstatSync(full);
           } catch { continue; }
           if (stat.isSymbolicLink()) continue;
           if (stat.isDirectory()) scan(full);
@@ -293,7 +297,7 @@ export function reportModStatus(): void {
   let skillCount = 0;
   try {
     const manifest = JSON.parse(
-      require('fs').readFileSync(join(skillsDir, 'manifest.json'), 'utf-8')
+      readFileSync(join(skillsDir, 'manifest.json'), 'utf-8')
     );
     skillCount = manifest.skills?.length || 0;
   } catch { /* manifest not found */ }
