@@ -2,6 +2,83 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.13.1] - 2026-04-20
+
+## **Fix wave: 4 hot issues that blocked real brains, landed together.**
+## **PGLite survives macOS 26.3. Minions actually rescues SIGKILL'd jobs. Autopilot dashboards stop the 14.6s seqscan. `bun install -g` tells you when it's broken.**
+
+v0.13.0 shipped a lot of capability and a lot of edge cases that only surface on production brains. v0.13.1 is the hotfix wave: four user-filed issues, fixed and verified together, plus three scope expansions that close adjacent footguns. Upgrade is automatic. If `gbrain upgrade` runs clean, your brain gets faster and more reliable on the next sync cycle.
+
+### The numbers that matter
+
+The four issues this release closes, with measured impact:
+
+| Issue | Before v0.13.1 | After v0.13.1 | Δ |
+|-------|----------------|----------------|---|
+| #170 `SELECT * FROM pages ORDER BY updated_at DESC` on 31k rows (Postgres) | ~14.6s seqscan | <20ms index scan | ~700x |
+| #219 `max_stalled` default on `minion_jobs` | 1 (first stall → dead) | 5 (four rescues before dead) | claim matches the docs |
+| #219 existing waiting/active jobs with `max_stalled=1` | will still dead-letter | backfilled to 5 on upgrade | closes the pain today |
+| #218 `bun install -g github:garrytan/gbrain` postinstall failure | silent `|| true` | visible stderr warning with recovery URL | users know it's broken |
+| #223 PGLite WASM crash on macOS 26.3 | raw `Aborted()`, no hint | pinned `@electric-sql/pglite` to `0.4.3` + actionable error message naming the issue | users can route to #223 |
+
+### What this means for you
+
+If you run autopilot against a Supabase brain with 30k+ pages, your health/dashboard cycle was silently burning 14.6 seconds on every iteration. The new index drops that to single-digit milliseconds without locking writes (Postgres gets `CREATE INDEX CONCURRENTLY` with an invalid-index cleanup DO block; PGLite gets plain `CREATE INDEX` since it has no concurrent writers). Your agent stops blocking on list-pages-by-date queries.
+
+If you use Minions, the "SIGKILL mid-flight, 10/10 rescued" claim is now actually true out-of-the-box. Default `max_stalled=5` means a kill -9'd worker gets picked up by the next worker instead of dead-lettered on first stall. v13 migration backfills existing non-terminal rows (`waiting/active/delayed/waiting-children/paused`) so upgrading doesn't leave a queue full of doomed jobs.
+
+If you install via `bun install -g github:...` (not recommended but people try it), you'll now see a loud stderr warning with a link to #218 instead of a broken CLI that fails on next invocation. The real fix is `git clone + bun link`, documented in README and INSTALL_FOR_AGENTS.md.
+
+If you're on macOS 26.3 and PGLite was crashing with `Aborted()`, the pin to 0.4.3 gives us the best shot at avoiding the WASM regression (noting: 0.4.3 is unverified against 26.3 in CI — the error-wrap at `pglite-engine.ts connect()` is the safety net if the pin doesn't hold). Any PGLite init failure now shows the #223 link instead of a raw runtime error.
+
+## To take advantage of v0.13.1
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the outcome:**
+   ```bash
+   psql "$DATABASE_URL" -c "\d minion_jobs" | grep max_stalled  # DEFAULT should be 5
+   psql "$DATABASE_URL" -c "\d pages" | grep idx_pages_updated_at_desc  # index should exist
+   gbrain doctor
+   ```
+3. **If any step fails or the numbers look wrong,** file an issue with `gbrain doctor` output and the contents of `~/.gbrain/upgrade-errors.jsonl` if it exists. https://github.com/garrytan/gbrain/issues
+
+### Itemized changes
+
+#### Added
+- Schema migration **v12** — `CREATE INDEX [CONCURRENTLY] IF NOT EXISTS idx_pages_updated_at_desc ON pages (updated_at DESC)` (engine-aware; Postgres uses CONCURRENTLY with an invalid-index DO-block cleanup, PGLite uses plain CREATE). Closes #170. Contributed by @fuleinist (#215).
+- Schema migration **v13** — `ALTER TABLE minion_jobs ALTER COLUMN max_stalled SET DEFAULT 5` + `UPDATE` backfill scoped to non-terminal statuses. Closes #219. Reported by @macbotmini-eng.
+- `MinionJobInput.max_stalled` — new optional field, plumbed through `queue.add()` with `[1, 100]` clamp.
+- `gbrain jobs submit --max-stalled N` — CLI flag to set per-job stall tolerance.
+- `gbrain jobs submit --backoff-type`, `--backoff-delay`, `--backoff-jitter`, `--timeout-ms`, `--idempotency-key` — scope-expansion audit exposing existing `MinionJobInput` fields as first-class CLI flags.
+- `gbrain jobs smoke --sigkill-rescue` — opt-in regression smoke case that simulates a killed worker and asserts the v0.13.1 default actually rescues.
+- `gbrain doctor --index-audit` — new opt-in Postgres check that reports zero-scan indexes from `pg_stat_user_indexes`. Informational only (no auto-drop). PGLite no-ops.
+- `BrainEngine.kind` readonly discriminator (`'postgres' | 'pglite'`) — lets migrations and consumers branch on engine without `instanceof` + dynamic imports.
+- `package.json trustedDependencies: ["@electric-sql/pglite"]` — lets Bun run PGLite's dep postinstall on global installs.
+
+#### Changed
+- `@electric-sql/pglite` pinned to exactly `0.4.3` (was `^0.4.4`) — best-available mitigation for the macOS 26.3 WASM abort. Reported by @AndreLYL (#223). Flagged as unverified; reproduce on a 26.3 machine and file a follow-up if it still aborts.
+- `package.json postinstall` — now warns loudly on stderr with a recovery URL instead of silencing errors with `2>/dev/null || true`. `bun install -g` hitting a migration failure now tells you what to do. Reported by @gopalpatel (#218).
+- `src/core/pglite-engine.ts connect()` — wraps `PGlite.create()` with a friendly error pointing at #223 and `gbrain doctor`. Nests the original error for debuggability.
+- `doctor` `schema_version` check — now fails loudly when `version=0` (migrations never ran), linking #218.
+- `README.md` + `INSTALL_FOR_AGENTS.md` — explicit warning against `bun install -g github:garrytan/gbrain`.
+
+#### Fixed
+- **The "SIGKILL mid-flight, 10/10 rescued" claim is now accurate** out-of-the-box (#219). Schema default bumped from 1 → 5.
+- **Autopilot dashboards stop blocking on list-pages queries** on 30k+ row Postgres brains (#170).
+- **PGLite error on macOS 26.3** is now actionable instead of a raw `Aborted()` (#223).
+- **`bun install -g` no longer produces a silently broken CLI** (#218) — postinstall surfaces failures.
+
+#### Internal
+- `Migration` interface extended with `sqlFor: { postgres?, pglite? }` + `transaction: boolean` fields. Runner picks the engine-specific SQL branch and (on Postgres only) bypasses `engine.transaction()` when `transaction: false` (required for CONCURRENTLY).
+- `scripts/check-jsonb-pattern.sh` extended with a CI guard against `max_stalled DEFAULT 1` regressing.
+- ~15 new unit tests covering max_stalled default/clamp/backfill/v12/v13 semantics. 3 regression tests pinned by IRON RULE.
+- Full E2E suite green (126 pass) against Postgres 16 + pgvector.
+
 ## [0.13.0] - 2026-04-20
 
 ## **Frontmatter becomes a graph. Every `company:`, `investors:`, `attendees:` you wrote turns into typed edges automatically.**

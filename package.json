@@ -1,6 +1,6 @@
 {
   "name": "gbrain",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "Postgres-native personal knowledge brain with hybrid RAG search",
   "type": "module",
   "main": "src/core/index.ts",
@@ -23,7 +23,7 @@
     "test": "scripts/check-jsonb-pattern.sh && bun test",
     "test:e2e": "bun test test/e2e/",
     "check:jsonb": "scripts/check-jsonb-pattern.sh",
-    "postinstall": "gbrain --version >/dev/null 2>&1 && gbrain apply-migrations --yes --non-interactive 2>/dev/null || true",
+    "postinstall": "command -v gbrain >/dev/null 2>&1 && gbrain apply-migrations --yes --non-interactive || echo '[gbrain] postinstall skipped. If installed via bun install -g github:...: run `gbrain doctor` and `gbrain apply-migrations --yes` manually. See https://github.com/garrytan/gbrain/issues/218' 1>&2",
     "prepublish:clawhub": "bun run build:all",
     "publish:clawhub": "clawhub package publish . --family bundle-plugin"
   },
@@ -35,7 +35,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.30.0",
     "@aws-sdk/client-s3": "^3.1028.0",
-    "@electric-sql/pglite": "^0.4.4",
+    "@electric-sql/pglite": "0.4.3",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "gray-matter": "^4.0.3",
     "marked": "^18.0.0",
@@ -46,5 +46,8 @@
   "devDependencies": {
     "@types/bun": "latest"
   },
+  "trustedDependencies": [
+    "@electric-sql/pglite"
+  ],
   "license": "MIT"
 }
