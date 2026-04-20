@@ -31,7 +31,12 @@ beforeEach(async () => {
   await engine.executeRaw('DELETE FROM subagent_messages');
   await engine.executeRaw('DELETE FROM subagent_tool_executions');
   await engine.executeRaw('DELETE FROM minion_jobs');
-  const j = await queue.add('subagent', { prompt: 'hi' });
+  const j = await queue.add(
+    'subagent',
+    { prompt: 'hi' },
+    {},
+    { allowProtectedSubmit: true },
+  );
   jobId = j.id;
 });
 

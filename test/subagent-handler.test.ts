@@ -72,9 +72,15 @@ class FakeMessagesClient implements MessagesClient {
 
 // Build a synthetic MinionJobContext around a real minion_jobs row. The
 // handler only reads data/id/signal/shutdownSignal/updateTokens — we stub
-// the rest.
+// the rest. `subagent` is a protected job name (Lane 4H) so tests submit
+// under the trusted-submit flag.
 async function makeCtx(input: unknown): Promise<MinionJobContext> {
-  const job = await queue.add('subagent', input as Record<string, unknown>);
+  const job = await queue.add(
+    'subagent',
+    input as Record<string, unknown>,
+    {},
+    { allowProtectedSubmit: true },
+  );
   const ac = new AbortController();
   const shutdown = new AbortController();
   return {

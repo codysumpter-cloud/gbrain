@@ -18,7 +18,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'apply-migrations', 'skillpack-check', 'resolvers', 'integrity', 'repair-jsonb', 'orphans']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'resolvers', 'integrity', 'repair-jsonb', 'orphans']);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -400,6 +400,11 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'jobs': {
         const { runJobs } = await import('./commands/jobs.ts');
         await runJobs(engine, args);
+        break;
+      }
+      case 'agent': {
+        const { runAgent } = await import('./commands/agent.ts');
+        await runAgent(engine, args);
         break;
       }
       case 'sync': {
