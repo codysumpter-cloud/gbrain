@@ -2,6 +2,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION } from '../core/migrate.ts';
 import { checkResolvable } from '../core/check-resolvable.ts';
+import { autoFixDryViolations, type AutoFixReport, type FixOutcome } from '../core/dry-fix.ts';
 import { loadCompletedMigrations } from '../core/preferences.ts';
 import { join } from 'path';
 import { existsSync, readFileSync, readdirSync } from 'fs';
@@ -21,7 +22,10 @@ export interface Check {
 export async function runDoctor(engine: BrainEngine | null, args: string[]) {
   const jsonOutput = args.includes('--json');
   const fastMode = args.includes('--fast');
+  const doFix = args.includes('--fix');
+  const dryRun = args.includes('--dry-run');
   const checks: Check[] = [];
+  let autoFixReport: AutoFixReport | null = null;
 
   // --- Filesystem checks (always run, no DB needed) ---
 
@@ -29,6 +33,15 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
   const repoRoot = findRepoRoot();
   if (repoRoot) {
     const skillsDir = join(repoRoot, 'skills');
+
+    // --fix: run auto-repair BEFORE checkResolvable so the post-fix scan
+    // reflects the new state. Auto-fix only targets DRY violations today;
+    // other resolver issues are left to human repair.
+    if (doFix) {
+      autoFixReport = autoFixDryViolations(skillsDir, { dryRun });
+      printAutoFixReport(autoFixReport, dryRun, jsonOutput);
+    }
+
     const report = checkResolvable(skillsDir);
     if (report.ok && report.issues.length === 0) {
       checks.push({
@@ -350,6 +363,36 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Print the auto-fix report in human-readable form. JSON output goes through
+ *  outputResults alongside the check list; this is the pretty-print path. */
+function printAutoFixReport(report: AutoFixReport, dryRun: boolean, jsonOutput: boolean): void {
+  if (jsonOutput) return; // JSON consumers read autoFixReport via the check issues / caller
+  const verb = dryRun ? 'PROPOSED' : 'APPLIED';
+  for (const outcome of report.fixed) {
+    console.log(`[${verb}] ${outcome.skillPath} (${outcome.patternLabel})`);
+    if (outcome.before) {
+      console.log('--- before');
+      console.log(outcome.before);
+      console.log('--- after');
+      console.log(outcome.after ?? '');
+      console.log('');
+    }
+  }
+  const n = report.fixed.length;
+  const s = report.skipped.length;
+  if (n === 0 && s === 0) {
+    console.log('Doctor --fix: no DRY violations to repair.');
+    return;
+  }
+  const label = dryRun ? 'fixes proposed' : 'fixes applied';
+  console.log(`${n} ${label}${s > 0 ? `, ${s} skipped:` : '.'}`);
+  for (const sk of report.skipped) {
+    const hint = sk.reason === 'working_tree_dirty' ? ' (run `git stash` first)' : '';
+    console.log(`  - ${sk.skillPath}: ${sk.reason}${hint}`);
+  }
+  if (dryRun && n > 0) console.log('\nRun without --dry-run to apply.');
+}
 
 /** Find the GBrain repo root by walking up from cwd looking for skills/RESOLVER.md */
 function findRepoRoot(): string | null {
