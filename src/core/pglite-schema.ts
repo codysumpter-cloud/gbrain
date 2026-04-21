@@ -265,7 +265,7 @@ CREATE INDEX IF NOT EXISTS idx_minion_attachments_job ON minion_attachments (job
 -- and PGLite may not support it. Postgres path applies it via migration v7.
 
 -- ============================================================
--- Subagent runtime (v0.15.0) — durable LLM loops
+-- Subagent runtime (v0.16.0) — durable LLM loops
 -- ============================================================
 CREATE TABLE IF NOT EXISTS subagent_messages (
   id                  BIGSERIAL PRIMARY KEY,

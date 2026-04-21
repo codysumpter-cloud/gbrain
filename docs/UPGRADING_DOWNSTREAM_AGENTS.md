@@ -358,7 +358,7 @@ upcoming `gbrain crontab-to-minions <file>` helper is P1 in TODOS.
 
 ---
 
-## v0.15.0: durable agent runtime
+## v0.16.0: durable agent runtime
 
 v0.15 ships `gbrain agent run` / `gbrain agent logs`, a new `subagent` handler
 type in Minions, and a plugin contract for host-repo subagent defs. None of the

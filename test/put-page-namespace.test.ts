@@ -1,5 +1,5 @@
 /**
- * Regression + namespace tests for put_page (v0.15.0 Lane 1D).
+ * Regression + namespace tests for put_page (v0.16.0 Lane 1D).
  *
  * The namespace rule confines subagent-originated writes to
  * `wiki/agents/<subagentId>/...`. This test pins:

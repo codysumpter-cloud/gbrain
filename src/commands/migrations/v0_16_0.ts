@@ -1,5 +1,5 @@
 /**
- * v0.15.0 migration orchestrator — Subagent runtime schema.
+ * v0.16.0 migration orchestrator — Subagent runtime schema.
  *
  * Adds three tables for durable LLM agent loops:
  *   - subagent_messages        Anthropic message-block persistence
@@ -82,7 +82,7 @@ async function phaseBVerify(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
 
 async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult> {
   console.log('');
-  console.log('=== v0.15.0 — Subagent runtime schema ===');
+  console.log('=== v0.16.0 — Subagent runtime schema ===');
   if (opts.dryRun) console.log('  (dry-run; no side effects)');
   console.log('');
 
@@ -107,7 +107,7 @@ function finalize(phases: OrchestratorPhaseResult[], status: 'complete' | 'parti
   if (status !== 'failed') {
     try {
       appendCompletedMigration({
-        version: '0.15.0',
+        version: '0.16.0',
         completed_at: new Date().toISOString(),
         status: status as 'complete' | 'partial',
         phases: phases.map(p => ({ name: p.name, status: p.status })),
@@ -116,15 +116,15 @@ function finalize(phases: OrchestratorPhaseResult[], status: 'complete' | 'parti
       // Recording is best-effort.
     }
   }
-  return { version: '0.15.0', status, phases };
+  return { version: '0.16.0', status, phases };
 }
 
-export const v0_15_0: Migration = {
-  version: '0.15.0',
+export const v0_16_0: Migration = {
+  version: '0.16.0',
   featurePitch: {
     headline: 'Durable LLM agents land in the brain — survive crashes, sleeps, and worker restarts.',
     description:
-      'v0.15.0 adds the subagent runtime: run long-running, fan-out Anthropic LLM loops ' +
+      'v0.16.0 adds the subagent runtime: run long-running, fan-out Anthropic LLM loops ' +
       'as first-class Minion jobs. Crash-resumable turn persistence, two-phase tool ledger, ' +
       'lease-based rate limit, parent-child fan-out with aggregation. Entry points: `gbrain ' +
       'agent run` and `gbrain agent logs`. See docs/guides/plugin-authors.md for shipping ' +

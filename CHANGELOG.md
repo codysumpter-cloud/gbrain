@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.15.0] - 2026-04-20
+## [0.16.0] - 2026-04-20
 
 ## **Durable agents land. Your LLM loops survive crashes, sleeps, and worker restarts now.**
 ## **Laptop closed mid-run? Come back, resume where it died.**

@@ -1,5 +1,5 @@
 /**
- * Regression test for the MCP tool-def extraction (v0.15.0 Lane 1A).
+ * Regression test for the MCP tool-def extraction (v0.16.0 Lane 1A).
  *
  * Before v0.15 the mapping lived inline in src/mcp/server.ts. After the
  * extraction, buildToolDefs is the single source of truth; the subagent tool

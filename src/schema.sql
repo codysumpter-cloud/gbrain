@@ -351,7 +351,7 @@ CREATE INDEX IF NOT EXISTS idx_minion_attachments_job ON minion_attachments (job
 ALTER TABLE minion_attachments ALTER COLUMN content SET STORAGE EXTERNAL;
 
 -- ============================================================
--- Subagent runtime (v0.15.0) — durable LLM loops
+-- Subagent runtime (v0.16.0) — durable LLM loops
 -- ============================================================
 -- Anthropic-native message blocks, one row per Messages API message. Parallel
 -- tool_use blocks in one assistant message live in content_blocks JSONB,

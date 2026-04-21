@@ -1,9 +1,9 @@
 /**
- * Unit tests for v0.15.0 migration orchestrator + registry.
+ * Unit tests for v0.16.0 migration orchestrator + registry.
  *
  * The full schema verification lives in E2E (Postgres). These unit tests
  * cover:
- *  - registry wiring (v0.15.0 registered + lookup works)
+ *  - registry wiring (v0.16.0 registered + lookup works)
  *  - v0.14.0 noop stub wired (gapless version sequence)
  *  - migration metadata (version, pitch)
  *  - dry-run short-circuits both phases
@@ -12,13 +12,13 @@
 
 import { describe, test, expect } from 'bun:test';
 import { migrations, getMigration } from '../src/commands/migrations/index.ts';
-import { __testing } from '../src/commands/migrations/v0_15_0.ts';
+import { __testing } from '../src/commands/migrations/v0_16_0.ts';
 
-describe('v0.15.0 migration', () => {
+describe('v0.16.0 migration', () => {
   test('is registered in the migrations registry', () => {
-    const v0_15_0 = getMigration('0.15.0');
-    expect(v0_15_0).not.toBeNull();
-    expect(v0_15_0?.version).toBe('0.15.0');
+    const v0_16_0 = getMigration('0.16.0');
+    expect(v0_16_0).not.toBeNull();
+    expect(v0_16_0?.version).toBe('0.16.0');
   });
 
   test('v0.14.0 noop stub is registered (gapless sequence)', () => {
@@ -27,13 +27,13 @@ describe('v0.15.0 migration', () => {
     expect(v0_14_0?.version).toBe('0.14.0');
   });
 
-  test('migrations array has no version gaps through 0.15.0', () => {
+  test('migrations array has no version gaps through 0.16.0', () => {
     const versions = migrations.map(m => m.version);
     expect(versions).toContain('0.13.1');
     expect(versions).toContain('0.14.0');
-    expect(versions).toContain('0.15.0');
+    expect(versions).toContain('0.16.0');
     // order check — registry is semver-sorted in the source
-    const v15Idx = versions.indexOf('0.15.0');
+    const v15Idx = versions.indexOf('0.16.0');
     const v14Idx = versions.indexOf('0.14.0');
     const v131Idx = versions.indexOf('0.13.1');
     expect(v131Idx).toBeLessThan(v14Idx);
@@ -41,7 +41,7 @@ describe('v0.15.0 migration', () => {
   });
 
   test('feature pitch has headline and description', () => {
-    const m = getMigration('0.15.0');
+    const m = getMigration('0.16.0');
     expect(m?.featurePitch.headline).toBeTruthy();
     expect(m?.featurePitch.description).toBeTruthy();
   });
@@ -67,9 +67,9 @@ describe('v0.15.0 migration', () => {
   });
 
   test('orchestrator in dry-run returns complete with both phases skipped', async () => {
-    const m = getMigration('0.15.0');
+    const m = getMigration('0.16.0');
     const result = await m!.orchestrator({ dryRun: true });
-    expect(result.version).toBe('0.15.0');
+    expect(result.version).toBe('0.16.0');
     expect(result.phases.length).toBe(2);
     expect(result.phases.every(p => p.status === 'skipped')).toBe(true);
   });
