@@ -237,6 +237,44 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     checks.push({ name: 'pgvector', status: 'warn', message: 'Could not check pgvector extension' });
   }
 
+  // 4b. PgBouncer / prepared-statement compatibility.
+  // URL-only inspection — no DB roundtrip — so this is cheap and works
+  // regardless of whether the caller is the module singleton or a
+  // worker-instance engine.
+  progress.heartbeat('pgbouncer_prepare');
+  try {
+    const { resolvePrepare } = await import('../core/db.ts');
+    const { loadConfig } = await import('../core/config.ts');
+    const config = loadConfig();
+    const url = config?.database_url || '';
+    const prepare = resolvePrepare(url);
+    if (prepare === false) {
+      checks.push({
+        name: 'pgbouncer_prepare',
+        status: 'ok',
+        message: 'Prepared statements disabled (PgBouncer-safe)',
+      });
+    } else {
+      try {
+        const parsed = new URL(url.replace(/^postgres(ql)?:\/\//, 'http://'));
+        if (parsed.port === '6543') {
+          checks.push({
+            name: 'pgbouncer_prepare',
+            status: 'warn',
+            message:
+              'Port 6543 (PgBouncer transaction mode) detected but prepared statements are enabled. ' +
+              'This causes "prepared statement does not exist" errors under concurrent load. ' +
+              'Fix: unset GBRAIN_PREPARE (or set =false), or add ?prepare=false to the connection URL.',
+          });
+        }
+      } catch {
+        // URL parse failure — skip, nothing actionable
+      }
+    }
+  } catch {
+    // best-effort; never fail doctor on this check
+  }
+
   // 5. RLS
   progress.heartbeat('rls');
   try {
