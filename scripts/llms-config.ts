@@ -93,6 +93,12 @@ export const SECTIONS: DocSection[] = [
         path: "docs/guides/cron-schedule.md",
       },
       {
+        title: "docs/guides/minions-deployment.md",
+        description:
+          "Deploying the gbrain jobs worker: crontab + watchdog, inline --follow, systemd/Procfile/fly.toml, upgrade checklist.",
+        path: "docs/guides/minions-deployment.md",
+      },
+      {
         title: "docs/guides/quiet-hours.md",
         description: "Notification hold + timezone-aware delivery.",
         path: "docs/guides/quiet-hours.md",

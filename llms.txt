@@ -18,6 +18,7 @@ Repo: https://github.com/garrytan/gbrain
 - [docs/GBRAIN_RECOMMENDED_SCHEMA.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/GBRAIN_RECOMMENDED_SCHEMA.md): MECE directory structure (people/, companies/, concepts/).
 - [docs/guides/live-sync.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/live-sync.md): Incremental markdown sync setup.
 - [docs/guides/cron-schedule.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/cron-schedule.md): Recurring job scheduling.
+- [docs/guides/minions-deployment.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/minions-deployment.md): Deploying the gbrain jobs worker: crontab + watchdog, inline --follow, systemd/Procfile/fly.toml, upgrade checklist.
 - [docs/guides/quiet-hours.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/quiet-hours.md): Notification hold + timezone-aware delivery.
 - [docs/mcp/DEPLOY.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/mcp/DEPLOY.md): MCP server deployment.
 
