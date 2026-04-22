@@ -75,6 +75,43 @@ describe('migrate v16 — sources_table_additive', () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────
+// v0.17.0 — v17 pages_source_id_composite_unique (Step 2, Lane B)
+// ─────────────────────────────────────────────────────────────────
+describe('migrate v17 — pages_source_id_composite_unique', () => {
+  const v17 = MIGRATIONS.find(m => m.version === 17);
+
+  test('v17 exists and is paired with Step 2 engine rewrite', () => {
+    expect(v17).toBeDefined();
+    expect(v17!.name).toBe('pages_source_id_composite_unique');
+  });
+
+  test('v17 adds pages.source_id with DEFAULT default REFERENCES sources', () => {
+    expect(v17!.sql).toContain('ALTER TABLE pages ADD COLUMN IF NOT EXISTS source_id TEXT');
+    // DEFAULT 'default' closes the race where an INSERT between ADD COLUMN
+    // and SET NOT NULL could leave source_id NULL (Codex second-pass review).
+    expect(v17!.sql).toContain("NOT NULL DEFAULT 'default' REFERENCES sources(id)");
+  });
+
+  test('v17 swaps UNIQUE(slug) → composite UNIQUE(source_id, slug)', () => {
+    // ON CONFLICT (source_id, slug) in putPage relies on this swap.
+    expect(v17!.sql).toContain('ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_slug_key');
+    expect(v17!.sql).toContain('pages_source_slug_key');
+    expect(v17!.sql).toContain('UNIQUE (source_id, slug)');
+  });
+
+  test('v17 creates source-scoped index for per-source scans', () => {
+    expect(v17!.sql).toContain('CREATE INDEX IF NOT EXISTS idx_pages_source_id');
+  });
+
+  test('v17 constraint add is guarded (idempotent re-run)', () => {
+    // DO block with IF NOT EXISTS guard means re-running the migration
+    // after partial failure doesn't error on the already-installed name.
+    expect(v17!.sql).toContain('IF NOT EXISTS');
+    expect(v17!.sql).toContain("WHERE conname = 'pages_source_slug_key'");
+  });
+});
+
 describe('migrate — ordering guarantee (v15 must NOT be skipped by v16)', () => {
   test('runMigrations sorts by version ascending', async () => {
     // Regression: if v16 preceded v15 in the MIGRATIONS array, the iterator

@@ -450,6 +450,43 @@ export const MIGRATIONS: Migration[] = [
     },
   },
   {
+    version: 17,
+    name: 'pages_source_id_composite_unique',
+    // v0.17.0 Step 2 (Lane B) — adds pages.source_id with DEFAULT 'default'
+    // and swaps the global UNIQUE(slug) for the composite UNIQUE(source_id,
+    // slug). Lands alongside the engine SQL rewrite that makes every
+    // ON CONFLICT (slug) → ON CONFLICT (source_id, slug) so the constraint
+    // swap is atomic with the code that writes under it.
+    //
+    // DEFAULT 'default' is load-bearing: closes the Codex-flagged race
+    // where an INSERT between ADD COLUMN and SET NOT NULL could leave
+    // source_id NULL. Because the default already references a valid
+    // sources row (seeded in v16), new INSERTs immediately get a valid FK.
+    //
+    // Idempotent: IF NOT EXISTS on ADD COLUMN, DROP IF EXISTS on the old
+    // constraint, DO block guard on the new constraint creation.
+    sql: `
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS source_id TEXT
+        NOT NULL DEFAULT 'default' REFERENCES sources(id) ON DELETE CASCADE;
+
+      CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
+
+      -- Swap global UNIQUE(slug) → composite UNIQUE(source_id, slug). The
+      -- original constraint is named pages_slug_key by Postgres convention
+      -- when the column was declared UNIQUE inline. Both drops are
+      -- idempotent.
+      ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_slug_key;
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'pages_source_slug_key'
+        ) THEN
+          ALTER TABLE pages ADD CONSTRAINT pages_source_slug_key
+            UNIQUE (source_id, slug);
+        END IF;
+      END $$;
+    `,
+  },
+  {
     version: 16,
     name: 'sources_table_additive',
     // v0.17.0 Step 1 (Lane A) — **additive only** so Step 1 is a safe

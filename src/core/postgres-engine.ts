@@ -115,10 +115,14 @@ export class PostgresEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
 
+    // v0.17.0 Step 2: source_id relies on schema DEFAULT 'default'. ON
+    // CONFLICT target becomes (source_id, slug) since global UNIQUE(slug)
+    // was dropped in migration v17. See pglite-engine.ts for matching
+    // notes; multi-source sync (Step 5) will surface an explicit sourceId.
     const rows = await sql`
       INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
       VALUES (${slug}, ${page.type}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter)}, ${hash}, now())
-      ON CONFLICT (slug) DO UPDATE SET
+      ON CONFLICT (source_id, slug) DO UPDATE SET
         type = EXCLUDED.type,
         title = EXCLUDED.title,
         compiled_truth = EXCLUDED.compiled_truth,

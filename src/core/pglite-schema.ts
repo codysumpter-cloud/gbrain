@@ -39,10 +39,13 @@ INSERT INTO sources (id, name, config)
 -- ============================================================
 -- pages: the core content table
 -- ============================================================
--- v0.17.0 Step 1: pages.source_id is NOT added yet (see src/schema.sql note).
+-- v0.17.0 (Step 2): source_id scopes each page. Slugs are unique per
+-- source — see src/schema.sql for the design notes.
 CREATE TABLE IF NOT EXISTS pages (
   id            SERIAL PRIMARY KEY,
-  slug          TEXT    NOT NULL UNIQUE,
+  source_id     TEXT    NOT NULL DEFAULT 'default'
+                REFERENCES sources(id) ON DELETE CASCADE,
+  slug          TEXT    NOT NULL,
   type          TEXT    NOT NULL,
   title         TEXT    NOT NULL,
   compiled_truth TEXT   NOT NULL DEFAULT '',
@@ -50,12 +53,14 @@ CREATE TABLE IF NOT EXISTS pages (
   frontmatter   JSONB   NOT NULL DEFAULT '{}',
   content_hash  TEXT,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
 
 -- ============================================================
 -- content_chunks: chunked content with embeddings

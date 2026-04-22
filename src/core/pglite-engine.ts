@@ -116,10 +116,15 @@ export class PGLiteEngine implements BrainEngine {
     const hash = page.content_hash || contentHash(page.compiled_truth, page.timeline || '');
     const frontmatter = page.frontmatter || {};
 
+    // v0.17.0 Step 2: source_id relies on the schema DEFAULT 'default' so
+    // existing callers still target the default source without threading
+    // a parameter. ON CONFLICT target becomes (source_id, slug) since the
+    // global UNIQUE(slug) was dropped in migration v17. Step 5+ will
+    // surface an explicit sourceId param on putPage for multi-source sync.
     const { rows } = await this.db.query(
       `INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, now())
-       ON CONFLICT (slug) DO UPDATE SET
+       ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          title = EXCLUDED.title,
          compiled_truth = EXCLUDED.compiled_truth,
