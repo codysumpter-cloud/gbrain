@@ -152,6 +152,13 @@ export interface BrainEngine {
    * Slugs with zero inbound links are present in the map with value 0.
    */
   getBacklinkCounts(slugs: string[]): Promise<Map<string, number>>;
+  /**
+   * Return every page with no inbound links (from any source).
+   * Domain comes from the frontmatter `domain` field (null if unset).
+   * The caller filters pseudo-pages + derives display domain.
+   * Used by `gbrain orphans` and `runCycle`'s orphan sweep phase.
+   */
+  findOrphanPages(): Promise<Array<{ slug: string; title: string; domain: string | null }>>;
 
   // Tags
   addTag(slug: string, tag: string): Promise<void>;

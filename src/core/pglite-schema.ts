@@ -311,6 +311,22 @@ CREATE TABLE IF NOT EXISTS subagent_rate_leases (
 CREATE INDEX IF NOT EXISTS idx_rate_leases_key_expires ON subagent_rate_leases (key, expires_at);
 
 -- ============================================================
+-- Cycle coordination lock — v0.17 runCycle primitive
+-- ============================================================
+-- See src/schema.sql for full rationale. One row per active cycle.
+-- PGLite is single-writer, so the lock doubly protects: the DB-level
+-- row + the file lock at ~/.gbrain/cycle.lock prevent concurrent
+-- CLI invocations from racing.
+CREATE TABLE IF NOT EXISTS gbrain_cycle_locks (
+  id              TEXT        PRIMARY KEY,
+  holder_pid      INT         NOT NULL,
+  holder_host     TEXT,
+  acquired_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ttl_expires_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cycle_locks_ttl ON gbrain_cycle_locks(ttl_expires_at);
+
+-- ============================================================
 -- Trigger-based search_vector (spans pages + timeline_entries)
 -- ============================================================
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS search_vector tsvector;

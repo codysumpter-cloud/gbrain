@@ -655,6 +655,21 @@ export class PGLiteEngine implements BrainEngine {
     return result;
   }
 
+  async findOrphanPages(): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+    const { rows } = await this.db.query(
+      `SELECT
+         p.slug,
+         COALESCE(p.title, p.slug) AS title,
+         p.frontmatter->>'domain' AS domain
+       FROM pages p
+       WHERE NOT EXISTS (
+         SELECT 1 FROM links l WHERE l.to_page_id = p.id
+       )
+       ORDER BY p.slug`
+    );
+    return rows as Array<{ slug: string; title: string; domain: string | null }>;
+  }
+
   // Tags
   async addTag(slug: string, tag: string): Promise<void> {
     await this.db.query(
