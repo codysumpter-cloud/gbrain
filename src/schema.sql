@@ -408,6 +408,24 @@ CREATE TABLE IF NOT EXISTS subagent_rate_leases (
 );
 CREATE INDEX IF NOT EXISTS idx_rate_leases_key_expires ON subagent_rate_leases (key, expires_at);
 
+-- ============================================================
+-- Cycle coordination lock — v0.17 runCycle primitive
+-- ============================================================
+-- One row per active cycle. Any caller (autopilot daemon, Minions
+-- autopilot-cycle handler, gbrain dream CLI) tries to acquire this
+-- row before running a DB-write phase. Holders refresh ttl_expires_at
+-- between phases; crashed holders auto-release once TTL expires.
+-- Works through PgBouncer transaction pooling, unlike session-scoped
+-- pg_try_advisory_lock.
+CREATE TABLE IF NOT EXISTS gbrain_cycle_locks (
+  id              TEXT        PRIMARY KEY,
+  holder_pid      INT         NOT NULL,
+  holder_host     TEXT,
+  acquired_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ttl_expires_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cycle_locks_ttl ON gbrain_cycle_locks(ttl_expires_at);
+
 -- NOTIFY trigger for real-time job events (Postgres only, not PGLite)
 CREATE OR REPLACE FUNCTION notify_minion_job_change() RETURNS trigger AS $$
 BEGIN
