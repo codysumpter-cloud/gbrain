@@ -2,87 +2,66 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.18.0] - 2026-04-20
+## [0.18.0] - 2026-04-21
 
-## **BrainBench v1 lands as a public benchmark. 4 adapters scored side-by-side, graph layer worth +31 points P@5.**
-## **Portable JSON schemas at `eval/schemas/` make v2 (Python + Inspect AI + Docker) a driver swap, not a rewrite.**
+## **BrainBench moves out. gbrain gets its install surface back.**
+## **The eval harness + 5MB fictional corpus now live in a sibling repo; gbrain exposes a clean public API they consume.**
 
-gbrain has had retrieval metrics for two versions. This release turns them into a reproducible benchmark anyone can run. `bun run eval:run` scores 4 adapters against each other on a 240-page Opus-generated rich-prose corpus: gbrain-after (the stack), ripgrep-bm25 (classic IR baseline), vector-only (commodity RAG, same embedder), and hybrid-nograph (gbrain with the graph disabled — same codebase, same embedder, same chunking, graph just turned off). The graph layer does the work. Graph on → P@5 49.1%. Graph off → P@5 17.8%. Everything else held constant.
+BrainBench is gbrain's benchmark harness — 10/12 Cats, 4-adapter scorecard, 418-item fictional corpus, 314 tests. In v0.17 it lived inside this repo. Every `bun install` pulled down the eval tree, `docs/benchmarks/*.md` reports, `pdf-parse` devDep, and auxiliary test fixtures whether or not you ever ran a benchmark. For the 99% of gbrain users who want a knowledge-brain CLI, that's ~5MB of noise.
 
-This release also lands the foundations for BrainBench v1 Complete (Cats 5/6/8/9/11 ship in follow-up PRs). Six portable JSON schemas at `eval/schemas/` — corpus manifest, public probe, tool surface, transcript, scorecard, evidence contract — pin the v1→v2 boundary. When v2 ports to Python + Inspect AI Agent Bridge + Docker sandbox, same fixtures and same tool contracts, zero rework. Eight gold file templates at `eval/data/gold/` scaffold the sealed qrels, adversarial perturbations, and citation labels that Cat 5/8/9 will fill in. A deterministic `amara-life-v1` skeleton generator produces the fictional messy-week corpus (50 emails, 300 Slack messages across 4 channels, 20 calendar events, 8 meeting transcripts, 40 first-person notes) with 10 contradictions + 5 stale facts + 5 poison items + 3 implicit preferences planted at fixed positions so gold files can cross-reference by fixture_id. An Opus prose generator with structured cache keys (sha256 over schema_version + template_hash + item_spec_hash) makes regeneration cheap and resilient to prompt tweaks.
+v0.18 moves BrainBench to [github.com/garrytan/gbrain-evals](https://github.com/garrytan/gbrain-evals). gbrain stays the knowledge-brain CLI + library. `gbrain-evals` depends on gbrain via GitHub URL and consumes it through the public exports map. Same benchmarks, same scorecards, same Cat runners, same 418-item fictional amara-life corpus — just a separate install. Folks who don't care about evals never download them. Folks who do clone one extra repo.
 
-### The numbers that matter
+The clean separation also gives gbrain a first real public API surface. `package.json` adds 11 new subpath exports — `gbrain/engine`, `gbrain/pglite-engine`, `gbrain/search/hybrid`, `gbrain/link-extraction`, `gbrain/extract`, and so on — covering every gbrain internal the eval harness reaches into. Third-party tools (not just BrainBench) now have a stable contract to consume. Removing any of these exports is a breaking change going forward.
 
-Measured by `bun run eval:run` (4 adapters × N=5 runs on the 240-page `world-v1` corpus). Reproducible; no API keys at run time; ~12 min wall clock on an M3 laptop.
+### What moved where
 
-| Adapter                                     | P@5        | R@5        | MRR    | Δ P@5 vs gbrain-after |
-|---------------------------------------------|------------|------------|--------|------------------------|
-| **gbrain-after** (PGLite + graph + hybrid)  | **49.1%**  | **97.9%**  | **0.81** | baseline               |
-| hybrid-nograph (gbrain minus graph)         | 17.8%      | 65.1%      | 0.41   | **−31.4 pts**          |
-| ripgrep-bm25 (classic IR)                   | 17.1%      | 62.4%      | 0.34   | −32.0 pts              |
-| vector-only (cosine, same embedder)         | 10.7%      | 40.7%      | 0.22   | −38.4 pts              |
+| Stays in gbrain | Moves to gbrain-evals |
+|-----------------|----------------------|
+| `src/` (CLI, MCP, engines, operations, skills runtime) | `eval/` (runners, adapters, generators, schemas, gold, cli) |
+| `Page.type` enum including `email/slack/calendar-event/note/meeting` (useful for any ingested format, not just evals) | `test/eval/` (314 tests across 14 files) |
+| `inferType()` heuristics for the new directory patterns | `docs/benchmarks/*.md` (all scorecards + regression reports) |
+| Public exports map — 11 new subpaths gbrain-evals consumes | `pdf-parse` devDep (only eval/runner/loaders/pdf.ts used it) |
+| `src/core/` test suite (1696 tests) | `eval:*` scripts (run from gbrain-evals now) |
 
-Historical regression comparison (v0.11.1 → v0.12.1, same harness, same queries):
+### What this means for you
 
-| Metric               | v0.11.1   | v0.12.1   | Δ             |
-|----------------------|-----------|-----------|---------------|
-| gbrain-after P@5     | 22.1%     | **49.1%** | **+27.0 pts** |
-| gbrain-after R@5     | 54.6%     | **97.9%** | **+43.3 pts** |
-| Typed links (extract)| 136       | **499**   | **×3.7**      |
-| Timeline entries     | 27        | **2,208** | **×82**       |
+If you install gbrain via `git clone + bun install` or via npm/clawhub, you get a smaller, cleaner checkout. No eval corpus. No benchmark reports. No pdf-parse. `bun test` runs only gbrain's own test suite, not eval tests.
 
-On v0.11.1, gbrain-after beat hybrid-nograph by only 4.3 points P@5. v0.12's extract upgrades (typed links ×3.7, timeline entries ×82) drove the jump to 31 points. The graph layer plus high-quality extraction together are load-bearing. Either piece alone moves the needle a few points. Both pieces, +31 P@5.
+If you want to run BrainBench: `git clone https://github.com/garrytan/gbrain-evals && cd gbrain-evals && bun install && bun run eval:run`. gbrain-evals fetches gbrain from GitHub via `"gbrain": "github:garrytan/gbrain#master"` so you always benchmark against the latest source.
 
-### What this means for external researchers
-
-If you're benchmarking personal-knowledge agent stacks, this is the first public apples-to-apples harness. Clone gbrain, `bun install && bun run eval:run`, get a scorecard in ~12 minutes. Add a new adapter at `eval/runner/adapters/*.ts` implementing the 167-line `Adapter` interface and score your stack side-by-side with four references.
-
-If you're porting BrainBench to a different driver (Python + Inspect AI + Docker in v2), read `eval/schemas/*.schema.json`. That's the contract boundary. Same corpus manifest, same public probes (gold stripped), same 12 read + 3 dry_run tools, same transcript format, same scorecard. Different driver, same benchmark.
+If you're a third-party library author importing gbrain internals: the new exports map is now your stable contract. Pin `gbrain/<subpath>` imports against a version, not a file path.
 
 ### Itemized changes
 
-**BrainBench v1 public benchmark:**
-- 4-adapter side-by-side scorecard at `eval/runner/multi-adapter.ts` with N=5 tolerance bands and seeded query order. Adapters: `ripgrep-bm25.ts`, `vector-only.ts`, `hybrid-nograph.ts`, and inline `gbrain-after`.
-- Tier 5 fuzzy queries (30 vague-recall probes) + Tier 5.5 synthetic outsider queries (50 AI-authored with provenance labels) at `eval/runner/queries/`.
-- Query schema validator at `eval/runner/queries/validator.ts` with temporal `as_of_date` enforcement.
-- Per-link-type accuracy runner at `eval/runner/type-accuracy.ts` on the 240-page rich-prose corpus (Cat 2).
-- Static HTML world explorer (`bun run eval:world:view`) for the fictional corpus.
-- PGLite teardown fix so `bun run eval:run` exits 0 cleanly.
-- `inferLinkType` prose precision: `works_at` and `advises` regex tightening (partial; remaining residuals tracked in TODOS.md).
-- Contributor docs at `eval/CONTRIBUTING.md`, `eval/RUNBOOK.md`, `eval/CREDITS.md`.
+**Extracted to [gbrain-evals](https://github.com/garrytan/gbrain-evals):**
+- `eval/` — schemas, runners, adapters, generators, queries, CLI tools, docs (CONTRIBUTING, RUNBOOK, CREDITS).
+- `test/eval/` — 14 test files, 314 tests covering schemas, sealed qrels, tool-bridge, agent adapter, judge, recorder, Cat 5/6/8/9/11, amara-life skeleton, adversarial-injections, pdf loader.
+- `docs/benchmarks/` — all scorecards and regression reports (4-adapter, v0.11 vs v0.12, Minions production/lab, tweet ingestion, knowledge runtime v0.13, BrainBench v1).
+- `pdf-parse` devDep — only consumed by `eval/runner/loaders/pdf.ts`.
+- `eval:*` package.json scripts — now live in gbrain-evals's `package.json` and run from there.
 
-**BrainBench v1 Complete foundations (new):**
-- 6 portable JSON schemas at `eval/schemas/*.schema.json`: corpus-manifest, public-probe, tool-schema (pinned 12 read + 3 dry_run tools, 32K tool-output cap), transcript, scorecard (N ∈ {1, 5, 10}), evidence-contract.
-- 8 gold file templates at `eval/data/gold/*.json`: entities, backlinks, qrels, contradictions, poison, personalization-rubric, implicit-preferences, citations.
-- `eval/generators/amara-life.ts` — deterministic procedural skeleton. 15 contacts picked from `world-v1`, 50+300+20+8+40 items across the formats. Mulberry32 seeded PRNG; byte-identical under reseed. Plants 10 contradictions + 5 stale facts + 5 poison items + 3 implicit preferences at deterministic positions.
-- `eval/generators/amara-life-gen.ts` — Opus prose expansion with structured cache key `sha256({schema_version, template_id, template_hash, model_id, model_params, seed, item_spec_hash})`. Cost-gated at $20 hard-stop. Writes `inbox/emails.jsonl`, `slack/messages.jsonl`, `calendar.ics`, `meetings/*.md`, `notes/*.md`, `docs/*.md`, plus `corpus-manifest.json`. Dry-run mode available for smoke testing the pipeline without LLM spend.
-- `Page.type` enum extended in both `src/core/types.ts` and `eval/runner/types.ts` with `email | slack | calendar-event | note` (+ `meeting` on the production side). `src/core/markdown.ts` `inferType()` heuristics updated.
-- 75 new tests at `test/eval/` covering: schema round-trip + coherence (48), skeleton determinism + perturbation counts + slug regex conformance (17), cache-key invalidation across schema/template/model/seed changes (10). All pass, 727 expect() calls, 33ms.
-- New scripts in `package.json`: `eval:generate-amara-life`, `eval:generate-amara-life:dry`. `test:eval` extended to include `test/eval/`.
+**Kept in gbrain (useful beyond evals):**
+- `Page.type` enum extensions in `src/core/types.ts`: `email | slack | calendar-event | note | meeting`. Any user ingesting an inbox dump, Slack export, iCal file, or meeting transcript benefits from first-class types.
+- `inferType()` heuristics in `src/core/markdown.ts` for `/emails/`, `/slack/`, `/cal/`, `/notes/`, `/meetings/` directory patterns.
+- 11 new public `exports` in `package.json`: `./pglite-engine`, `./link-extraction`, `./import-file`, `./transcription`, `./embedding`, `./config`, `./markdown`, `./backoff`, `./search/hybrid`, `./search/expansion`, `./extract`. These form gbrain's public-API contract for downstream consumers.
 
-**Benchmark reports committed:**
-- `docs/benchmarks/2026-04-19-brainbench-multi-adapter.md` — 4-adapter scorecard with full config card.
-- `docs/benchmarks/2026-04-19-brainbench-v0_11-vs-v0_12.md` — regression comparison isolating the v0.12 extract-quality contribution.
+**Docs synced:**
+- `README.md` — benchmark references now point at the gbrain-evals repo.
+- `CLAUDE.md` — BrainBench section replaced with a pointer to gbrain-evals + the list of public exports that consumers depend on.
+- `src/commands/migrations/v0_12_0.ts` — migration banner text references `github.com/garrytan/gbrain-evals` instead of a local `docs/benchmarks/*.md` path that no longer resolves.
 
-**Review pipeline for this PR:**
-- CEO Review (SCOPE_EXPANSION) — 6 expansions proposed, 6 accepted.
-- Eng Review (FULL_REVIEW) — 7 issues surfaced and resolved in the plan.
-- Codex Review — 21 findings, 11 P0/P1 incorporated into Revision 3 of the plan. Cross-model agreement rate 9% (91% of Codex's findings were unique to Codex).
+**Tests:** 1717 gbrain tests pass, 0 failures, 174 skipped (E2E requiring `DATABASE_URL`). Full eval suite (314 tests) moves with `gbrain-evals` and runs from there.
 
-**Tests:** 1471 → **2082 pass** (+325 from master merges, +314 new eval tests), 0 failures, 174 skipped (E2E requiring `DATABASE_URL`).
+### To take advantage of v0.18
 
-**Days 4-10 also ship in this PR (BrainBench v1 Complete):**
-- **Day 4** — `pdf-parse` devDep + `eval/runner/recorder.ts` (6-artifact flight-recorder with atomic writes + collision retry) + `eval/runner/tool-bridge.ts` (12 read + 3 dry-run tools, `expand:false` hard-set on `query` to kill hidden Haiku calls, 32K tool-output cap, poison-slug tagging).
-- **Day 5** — `eval/runner/adapters/claude-sonnet-with-tools.ts` (Sonnet agent loop, turn cap 10, exponential backoff on rate limits) + `eval/runner/judge.ts` (Haiku via structured evidence contract — raw tool output NEVER reaches the judge, so paraphrased injection payloads in `gold/poison.json` are defeated by construction).
-- **Day 6** — `eval/runner/adversarial-injections.ts` (6 kinds: code-fence leak, inline-code slug, substring collision, ambiguous role, prose-only mention, multi-entity sentence) + `eval/runner/cat6-prose-scale.ts` (baseline-only prose scale eval) + `eval/runner/cat11-multimodal.ts` (PDF/audio/HTML fidelity with opt-in transcription).
-- **Day 7** — `eval/runner/cat5-provenance.ts` with dedicated `classify_claim` tool returning the three-way label `supported | unsupported | over-generalized`.
-- **Day 8** — `eval/runner/cat8-skill-compliance.ts` (brain-first / back-link / citation-format / tier-escalation metrics, deterministic from tool-bridge trace — no judge call needed) + `eval/runner/cat9-workflows.ts` (rubric-graded scenarios per workflow with per-workflow pass-rate rollup).
-- **Day 9** — `PublicPage` + `PublicQuery` + `sanitizePage` + `sanitizeQuery` in `eval/runner/types.ts`; `multi-adapter.ts` sanitizes at the adapter boundary so `_facts` and `gold` cannot leak. Honest soft-seal documentation; hard-seal via process isolation ships with v2 Docker.
-- **Day 10** — `eval/runner/all.ts` rewrite from `execSync` sequential to async subprocess fanout with `p-limit(2)` concurrency cap + `eval/runner/llm-budget.ts` (shared Anthropic-call semaphore across agent + judge, default 4 concurrent). `BRAINBENCH_N={1,5,10}` tiers map to smoke / iteration / published.
+For gbrain users:
+1. `gbrain upgrade` — no action required. The extraction is transparent.
+2. If you previously ran `bun run eval:*` scripts from this repo: those scripts no longer exist here. `git clone https://github.com/garrytan/gbrain-evals && bun install` to get them.
 
-**Corpus generation (Day 3b — run locally by the author):** 398 Opus calls, 84K input / 38K output tokens, **\$4.12 spent** (vs \$20 cap, vs \$12 estimate). 418 items landed under `eval/data/amara-life-v1/` with 10 planted contradictions, 5 stale facts, 5 paraphrased-injection poison items, 3 implicit preferences. Corpus itself stays local until the v0.18 brainbench split (per design-doc direction: `brainbench` becomes a standalone MIT sibling repo that depends on `gbrain`, keeping this repo lean).
-
-**Deferred to v0.19 (brainbench split):** Moving `eval/`, `test/eval/`, `docs/benchmarks/*`, the corpus, and all Cat runners into `github.com/garrytan/brainbench`. gbrain stays the knowledge-brain CLI + library; brainbench consumes it via GitHub-URL dep. Matches the v2 design-doc topology.
+For gbrain-evals consumers:
+1. Clone the sibling repo: `git clone https://github.com/garrytan/gbrain-evals`
+2. `bun install && bun run eval:run`
+3. Follow `gbrain-evals/eval/RUNBOOK.md` for full category runs and scorecard reproduction.
 
 ## [0.14.2] - 2026-04-20
 

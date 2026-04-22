@@ -13,7 +13,18 @@
     "./types": "./src/core/types.ts",
     "./operations": "./src/core/operations.ts",
     "./minions": "./src/core/minions/index.ts",
-    "./engine-factory": "./src/core/engine-factory.ts"
+    "./engine-factory": "./src/core/engine-factory.ts",
+    "./pglite-engine": "./src/core/pglite-engine.ts",
+    "./link-extraction": "./src/core/link-extraction.ts",
+    "./import-file": "./src/core/import-file.ts",
+    "./transcription": "./src/core/transcription.ts",
+    "./embedding": "./src/core/embedding.ts",
+    "./config": "./src/core/config.ts",
+    "./markdown": "./src/core/markdown.ts",
+    "./backoff": "./src/core/backoff.ts",
+    "./search/hybrid": "./src/core/search/hybrid.ts",
+    "./search/expansion": "./src/core/search/expansion.ts",
+    "./extract": "./src/commands/extract.ts"
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
@@ -22,22 +33,7 @@
     "build:schema": "bash scripts/build-schema.sh",
     "test": "scripts/check-jsonb-pattern.sh && bun test",
     "test:e2e": "bun test test/e2e/",
-    "test:eval": "bun test eval/runner/queries/validator.test.ts eval/runner/adapters/ eval/generators/world-html.test.ts test/eval/",
     "check:jsonb": "scripts/check-jsonb-pattern.sh",
-    "eval:run": "bun eval/runner/multi-adapter.ts",
-    "eval:run:dev": "BRAINBENCH_N=1 bun eval/runner/multi-adapter.ts",
-    "eval:world:view": "bun eval/cli/world-view.ts",
-    "eval:world:render": "bun eval/cli/world-view.ts --no-open",
-    "eval:query:validate": "bun eval/cli/query-validate.ts",
-    "eval:query:new": "bun eval/cli/query-new.ts",
-    "eval:type-accuracy": "bun eval/runner/type-accuracy.ts",
-    "eval:generate-amara-life": "bun eval/generators/amara-life-gen.ts",
-    "eval:generate-amara-life:dry": "bun eval/generators/amara-life-gen.ts --dry-run",
-    "eval:brainbench": "bun eval/runner/all.ts",
-    "eval:brainbench:smoke": "BRAINBENCH_N=1 BRAINBENCH_CONCURRENCY=2 bun eval/runner/all.ts",
-    "eval:brainbench:published": "BRAINBENCH_N=10 BRAINBENCH_CONCURRENCY=2 bun eval/runner/all.ts",
-    "eval:cat6": "bun eval/runner/cat6-prose-scale.ts",
-    "eval:cat11": "bun eval/runner/cat11-multimodal.ts",
     "postinstall": "gbrain --version >/dev/null 2>&1 && gbrain apply-migrations --yes --non-interactive 2>/dev/null || true",
     "prepublish:clawhub": "bun run build:all",
     "publish:clawhub": "clawhub package publish . --family bundle-plugin"
@@ -59,8 +55,7 @@
     "postgres": "^3.4.0"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "pdf-parse": "^2.4.5"
+    "@types/bun": "latest"
   },
   "license": "MIT"
 }
