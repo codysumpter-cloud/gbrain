@@ -17,9 +17,37 @@ export async function embed(text: string): Promise<Float32Array> {
   return gatewayEmbedOne(text);
 }
 
-/** Embed a batch of texts. */
-export async function embedBatch(texts: string[]): Promise<Float32Array[]> {
-  return gatewayEmbed(texts);
+export interface EmbedBatchOptions {
+  /**
+   * Optional callback fired after each sub-batch completes. CLI wrappers
+   * tick a reporter; Minion handlers can call job.updateProgress here.
+   */
+  onBatchComplete?: (done: number, total: number) => void;
+}
+
+/**
+ * Embed a batch of texts via the gateway. Sub-batches of 100 so upstream
+ * progress callbacks fire incrementally on large imports. The gateway
+ * handles truncation, retries, and provider dispatch.
+ */
+const BATCH_SIZE = 100;
+export async function embedBatch(
+  texts: string[],
+  options: EmbedBatchOptions = {},
+): Promise<Float32Array[]> {
+  if (!texts || texts.length === 0) return [];
+  // Fast path: small batch, no progress callback — single gateway call.
+  if (texts.length <= BATCH_SIZE && !options.onBatchComplete) {
+    return gatewayEmbed(texts);
+  }
+  const results: Float32Array[] = [];
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const slice = texts.slice(i, i + BATCH_SIZE);
+    const out = await gatewayEmbed(slice);
+    results.push(...out);
+    options.onBatchComplete?.(results.length, texts.length);
+  }
+  return results;
 }
 
 /** Currently-configured embedding model (short form without provider prefix). */

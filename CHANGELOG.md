@@ -138,6 +138,412 @@ v0.14 migrated 2 of 6 AI touchpoints. v0.15 migrates the rest through the same g
 All 8 competing PRs close with thanks and a config recipe for each author's provider.
 
 ---
+## [0.16.0] - 2026-04-20
+
+## **Durable agents land. Your LLM loops survive crashes, timeouts, and worker restarts now.**
+## **OpenClaw died mid-run? Come back, resume from the last committed turn.**
+
+Your OpenClaw crashes daily. Not "sometimes." Daily. An 8-turn OpenClaw subagent fires a tool call, the worker dies on a memory blip, all eight turns of context are gone, and there's nothing to do but start over from turn zero. This release kills that. `gbrain agent run` submits an Anthropic Messages API conversation as a first-class Minion job: every turn persists to `subagent_messages`, every tool call is a two-phase ledger row (`pending` → `complete | failed`), and replay on worker restart picks up from exactly the last committed turn. Crash-safe by construction, not by hope.
+
+Fan-out works the same way. `--fanout-manifest` splits N prompts across N subagent children plus one aggregator. Children run `on_child_fail: 'continue'` so one failing run doesn't cascade, and the aggregator claims after all children reach ANY terminal state (complete, failed, dead, cancelled, timeout) and writes a mixed-outcome summary. No polling loop, no dead parents stranded in `waiting-children`.
+
+Plugins work. Host repos drop a `gbrain.plugin.json` + `subagents/*.md` dir somewhere on `GBRAIN_PLUGIN_PATH`, and their custom subagent defs load at worker startup. Your OpenClaw ships its meeting-ingestion, signal-detector, and daily-task-prep subagents in its own repo now; gbrain discovers them day one. Collision rule is deterministic (left-wins with a loud warning). Trust boundary is strict on purpose: plugins ship DEFS, not tools. Tool allow-list stays here.
+
+### The numbers that matter
+
+Measured on the v0.15 branch against real Postgres via `bun run test:e2e`, plus the 159 new unit tests across 10 new test files. Coverage: 12 new runtime modules, 53+ code paths + user flows traced, 3 critical regression tests for the shell-jobs queue surface.
+
+| Metric                                                   | BEFORE v0.15                       | AFTER v0.15                                 | Δ                                    |
+|----------------------------------------------------------|------------------------------------|---------------------------------------------|--------------------------------------|
+| Your OpenClaw run survives worker kill mid-tool-call     | No (start over)                    | Yes (resume from last committed turn)        | crash-recovery unlocked              |
+| Fan-out run with 1 failed child out of N                 | Aggregator fails                   | Aggregator still claims + summarizes         | mixed-outcome aggregation works      |
+| `gbrain agent logs --follow` during long Anthropic call  | Silent (looks frozen)              | Heartbeat line per turn boundary              | visible progress                     |
+| Tool-use replay on resume                                 | N/A (no resume)                    | Idempotent re-run, non-idempotent aborts      | two-phase protocol                   |
+| `put_page` exposure to agent-driven writes               | Full write surface                 | Namespace-scoped `wiki/agents/<id>/…`         | fail-closed, server-enforced         |
+| Plugin subagent defs for downstream hosts                | Not supported                      | `GBRAIN_PLUGIN_PATH` + validated at startup   | OpenClaw day-1 usable                |
+| Rate-lease capacity leaks on worker crash                 | Counter-based (leaks)              | Lease-based (auto-prune on next acquire)      | no starvation after SIGKILL          |
+| Anthropic prompt cache on 40-turn agent                   | Per-turn cold                      | `cache_control: ephemeral` on system + tools  | ~10x cost reduction (best-case)      |
+
+### What this means for your OpenClaw
+
+You stop rerunning from zero. A crash at 3am that used to lose two hours of turns now costs you whatever fraction of one turn was in-flight when the worker died. The rest of the conversation is rows in `subagent_messages` and `subagent_tool_executions`, and the next worker claim replays from there. `gbrain agent logs <job>` shows you where it died, which tool it was running, and what came back from the last successful call. Real debugging, not guessing.
+
+Credit: shell-jobs (v0.14) established every pattern v0.15 reuses — handler signature, dual-signal abort, ctx.updateTokens, protected-names, trusted-submit, JSONL audit log, timeout_ms. Codex caught the Mode A "transparent Agent() interception" impossibility during plan review and saved the shape of this work. The v0.15 handler is what survives on the other side of that review.
+
+### Itemized changes
+
+**New capability: `gbrain agent` CLI**
+- `gbrain agent run <prompt> [--subagent-def|--model|--max-turns|--tools|--timeout-ms|--fanout-manifest|--follow|--detach]` — submits a subagent job (or fan-out of N subagents + aggregator) under the trusted-submit flag. Follow mode tails status + logs until terminal; detach prints the job id and exits. Ctrl-C detaches (job keeps running), does not cancel.
+- `gbrain agent logs <job_id> [--follow] [--since ISO-or-relative]` — merges the JSONL heartbeat audit with persisted `subagent_messages` into one chronological timeline. `--since 5m` / `1h` / `2d` shorthand supported. Transcript tail renders the full message + tool tree only after the job is terminal.
+- Always registered on the worker (no separate env flag). `ANTHROPIC_API_KEY` is the natural cost gate — no key, the SDK call fails immediately. Who-can-submit is already gated by `PROTECTED_JOB_NAMES` + `TrustedSubmitOpts` so only the trusted-CLI path can insert `subagent` / `subagent_aggregator` rows.
+
+**New durability primitives**
+- `src/core/minions/handlers/subagent.ts` — the LLM-loop handler. Two-phase tool persistence, replay reconciliation for mid-dispatch crashes, dual-signal abort (`ctx.signal` + `ctx.shutdownSignal`), Anthropic prompt caching on system + tool defs, injectable `MessagesClient` for mocking.
+- `src/core/minions/handlers/subagent-aggregator.ts` — claims AFTER all children resolve (Lane 1B's queue changes guarantee each terminal child posts a `child_done` inbox message), produces deterministic mixed-outcome markdown summary.
+- `src/core/minions/rate-leases.ts` — lease-based concurrency cap for outbound providers. Owner-tagged rows with `expires_at` auto-prune on acquire, so a crashed worker can't strand capacity. `pg_advisory_xact_lock` guards the check-then-insert.
+- `src/core/minions/wait-for-completion.ts` — poll-until-terminal helper for CLI callers. `TimeoutError` does NOT cancel the job; AbortSignal exits cleanly. Default `pollMs`: 1000 on Postgres, 250 on PGLite inline.
+- `src/core/minions/handlers/subagent-audit.ts` — JSONL audit + heartbeat writer. Rotates weekly via ISO week. `readSubagentAuditForJob` is the readback path for `gbrain agent logs`.
+- `src/core/minions/transcript.ts` — messages + tool executions → markdown renderer. UTF-8-safe truncation; unknown block types fall through to JSON for diagnostics.
+- `src/core/minions/tools/brain-allowlist.ts` — derives the subagent tool registry from `src/core/operations.ts`. 11-name allow-list (read-only + deterministic `put_page`). `put_page` schema is namespace-wrapped per subagent so the model writes correct slugs first-try; the server-side check in `put_page` is the authoritative gate.
+- `src/core/minions/plugin-loader.ts` — `GBRAIN_PLUGIN_PATH` (colon-separated absolute paths like `PATH`) + `gbrain.plugin.json` manifest + `subagents/*.md` defs. Strict path policy, left-wins collision, plugins ship DEFS only (no new tools), `allowed_tools:` validated at load time.
+- `src/mcp/tool-defs.ts` — extracted from an inline `operations.map(...)` block in the MCP server so subagent + MCP use the same source of truth. Byte-for-byte equivalence pinned by regression test.
+
+**Schema (3 new tables + OperationContext fields + migration orchestrator)**
+- `subagent_messages` — Anthropic message-block persistence. `(job_id, message_idx)` UNIQUE; `content_blocks JSONB` holds parallel tool_use blocks in one assistant message.
+- `subagent_tool_executions` — two-phase ledger. `(job_id, tool_use_id)` UNIQUE; status: `pending | complete | failed`.
+- `subagent_rate_leases` — lease-based concurrency control. CASCADE deletes on owning job removal so no leaked rows.
+- `OperationContext` gains `jobId?`, `subagentId?`, and `viaSubagent?` (fail-closed signal for agent-path gating). Added to `src/core/operations.ts`.
+- `src/commands/migrations/v0_15_0.ts` — post-upgrade orchestrator (phases: schema → verify → record). `v0_14_0.ts` noop stub keeps the registry version sequence gapless.
+
+**Queue correctness fixes**
+- `failJob`, `cancelJob`, and `handleTimeouts` all emit `child_done` inbox messages with `outcome: 'complete' | 'failed' | 'dead' | 'cancelled' | 'timeout'`. Pre-v0.15 only `completeJob` emitted; failed/cancelled/timed-out children silently stranded aggregator-style parents.
+- Parent-resolution terminal set expanded from `{completed, dead, cancelled}` to include `'failed'` everywhere parent-state is checked. A failed child with `on_child_fail: 'continue'` now correctly unblocks the parent.
+- `failJob` emits `child_done` BEFORE the parent-terminal UPDATE. Without insertion ordering, the EXISTS guard on the inbox INSERT would skip the row on `fail_parent` paths (caught by codex iteration 3).
+- `MinionJobInput.max_stalled` threads through `MinionQueue.add()` as INSERT param (not UPDATE on idempotency replay — that would mutate first-submitter state).
+
+**Trust model**
+- `subagent` and `subagent_aggregator` join `PROTECTED_JOB_NAMES`. MCP `submit_job` returns `permission_denied`; only `gbrain agent run` (with `allowProtectedSubmit`) can insert these rows.
+- `put_page` gains a server-side fail-closed namespace check: when `ctx.viaSubagent === true`, `slug` MUST match `^wiki/agents/<subagentId>/.+` — even if `subagentId` is undefined (dispatcher bug must not open a hole).
+
+**Docs**
+- `docs/guides/plugin-authors.md` — downstream-OpenClaw-facing walkthrough (minimum viable plugin, path + collision + trust policies, frontmatter fields, caveats).
+- 12 bisectable commits on `garrytan/minions-seam`, each PR-worthy on its own; the full series lands v0.15.0 end-to-end.
+
+**Tests**
+- 159 new unit tests across 10 new files: `mcp-tool-defs`, `put-page-namespace`, `migrations-v0_15_0`, `queue-child-done`, `rate-leases`, `wait-for-completion`, `brain-allowlist`, `subagent-audit`, `subagent-transcript`, `subagent-handler`, `subagent-aggregator`, `plugin-loader`, `agent-cli`.
+- 3 critical regression tests pin the shell-jobs queue surface: `failJob` child_done behavior, `put_page` namespace path for non-subagent callers, MCP `buildToolDefs` byte-equivalence.
+- E2E `minions-resilience.test.ts` updated: the max_children test renames its spawned children off the now-protected `subagent` name.
+
+## [0.15.4] - 2026-04-21
+
+## **PgBouncer transaction-mode prepared statements, fixed at the pool.**
+## **`gbrain jobs work` against Supabase pooler stops silently dropping rows.**
+
+Three separate PRs (#284, #286, #270) were all trying to fix the same bug: on a Supabase transaction-mode pooler (port 6543), `postgres.js`'s per-client prepared-statement cache goes stale every time PgBouncer recycles the backend connection. The symptom under sustained gbrain load is `prepared statement "xyz" does not exist` in the logs and silently dropped rows during sync. v0.15.4 lands the combined fix: the `resolvePrepare()` helper from #284, the both-connection-paths coverage from @notjbg's community PR #270, a new doctor check, and real tests against `bun:test`. The one-liner in #286 is dominated by this.
+
+### The one number that matters
+
+There isn't a benchmark, there's a correctness gate. On a Supabase pooler at port 6543 with a 4,500-page sync:
+
+| | Before v0.15.4 | After v0.15.4 |
+|---|---|---|
+| `prepared statement ... does not exist` errors | Dozens per sync | Zero |
+| Rows inserted vs. manifest count | Short by 50-200 rows (silent) | 1:1 parity |
+| `gbrain jobs work` crash under load | Yes | No |
+
+The silent-drop is the dangerous half. You run `gbrain sync`, the exit code is 0, the logs have a few noise lines you scroll past, and three weeks later you notice your brain is missing pages. `resolvePrepare(url)` disables prepared statements when the URL targets port 6543, and the doctor check flags the misconfiguration if you've manually forced `GBRAIN_PREPARE=true` on that port.
+
+### What this means for pooler users
+
+If you connect via `aws-0-REGION.pooler.supabase.com:6543`, do nothing. The upgrade disables prepared statements automatically and `gbrain doctor` confirms it with `pgbouncer_prepare: ok`. If you're on session mode (port 5432 on the pooler host) or direct Postgres, nothing changes: prepared statements stay on, plan caching stays intact. If your PgBouncer runs in session mode on a non-standard port, set `GBRAIN_PREPARE=true` explicitly.
+
+## To take advantage of v0.15.4
+
+`gbrain upgrade` handles this automatically. If you're not sure whether the fix is live:
+
+1. **Run the doctor check:**
+   ```bash
+   gbrain doctor
+   ```
+   Look for `pgbouncer_prepare`. On a `:6543` URL you should see `ok` (prepared statements disabled). On a direct URL the check silently passes.
+2. **Verify on sustained load:**
+   ```bash
+   gbrain sync
+   ```
+   Zero `prepared statement ... does not exist` log lines. Row count inserted matches the source manifest.
+3. **If something looks wrong,** file an issue at https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - the connection URL shape (port and pooler hostname — redact credentials)
+   - whether `GBRAIN_PREPARE` is set
+
+### Itemized changes
+
+**Fixed**
+- **Supabase PgBouncer port-6543 prepared statements no longer break sync.** New `resolvePrepare(url)` helper in `src/core/db.ts` with 4-level precedence: `GBRAIN_PREPARE` env var → `?prepare=` query param → port-6543 auto-detect → default. Wired into both the module-singleton `connect()` in `db.ts` AND the worker-instance `PostgresEngine.connect({poolSize})` in `src/core/postgres-engine.ts` so `gbrain jobs work` gets the same treatment as the main CLI. The second path was the gap #284 missed; community PR #270 caught it. Contributed by @notjbg.
+- **`gbrain doctor` surfaces the misconfiguration.** New `pgbouncer_prepare` check reads the configured URL via `loadConfig()` and reports `ok` when prepared statements are safely disabled, `warn` when the URL points at port 6543 but prepared statements are still enabled (the footgun that caused silent row drops).
+
+**Tests**
+- New `test/resolve-prepare.test.ts` — 11 cases covering the full precedence matrix: env override, URL query param, port auto-detect, malformed URLs, `postgres://` vs `postgresql://` schemes, URL-encoded credentials. Uses `bun:test` (not vitest — #284's original tests were in the wrong framework and would never have run).
+- Extended `test/postgres-engine.test.ts` — new source-level grep assertion that the worker-instance `connect({poolSize})` branch calls `db.resolvePrepare(url)` and conditionally includes the `prepare` key in the options literal. Mirrors the existing `SET LOCAL statement_timeout` guardrail in the same file. If anyone rips out the wiring, the build fails before a shipping brain drops rows.
+
+**Supersedes**
+- Closes #284 (ours, Wintermute): architecture landed as-is (port-only detection, no hostname expansion). Tests rewritten from vitest to bun:test.
+- Closes #286 (ours, Codex one-liner): dominated; unconditional `prepare: false` would have cost direct-Postgres users plan caching for no reason.
+- Closes #270 (@notjbg): the critical both-connection-paths insight landed; credit preserved in commit trailer and this CHANGELOG entry.
+
+## [0.15.3] - 2026-04-21
+
+## **Two upgrade-night bugs that crashed v0.13 → v0.14, now fixed with regression guards.**
+## **Migrations find the right binary. Autopilot spawns its worker. `gbrain upgrade` survives.**
+
+Tonight's production upgrade surfaced eleven bugs. Two of them — Bug 1 (the migration shell-out) and Bug 4 (the autopilot resolver) — survived two eng-review passes AND nine Codex reviews with correct diagnoses and implementable fixes. The other nine had wrong root causes or unimplementable architectures (documented in `~/.claude/plans/` as deferred work with grounded starting context for future `/investigate` sessions). This release ships the two clean fixes so the next `gbrain upgrade` actually lands.
+
+### Itemized changes
+
+**Fixed**
+- **`gbrain upgrade` no longer crashes mid-migration on bun installs.** The v0.13.0 migration orchestrator used to shell out via `process.execPath`, which on bun-installed trees is the `bun` runtime itself. `${bun} extract links --source db …` got reinterpreted as `bun run extract` and crashed with "script not found." The fix drops the execPath detour and shells out to the bare `gbrain` string, letting the canonical shim on PATH (`/usr/local/bin/gbrain` by default) win. Regression test in `test/migrations-v0_13_0.test.ts` greps the source for `process.execPath` and fails the build if anyone reintroduces the pattern. Contributed by @garrytan.
+- **Autopilot spawns its Minions worker again.** `resolveGbrainCliPath` checked `argv[1]` first and happily returned `/path/to/src/cli.ts` on bun-source installs. `spawn()` then failed with `EACCES` because TypeScript source isn't executable, and autopilot silently lost its worker. The fix reorders the probe: `which gbrain` (shim on PATH) wins first, then compiled `process.execPath`, then an `argv[1]=/gbrain` fallback. The `.ts` branch is deleted entirely. A critical regression test enforces that the resolver NEVER returns a `.ts` path across any combination of `argv[1]` + `process.execPath` + shim availability.
+
+**Tests**
+- New `test/migrations-v0_13_0.test.ts` — 7 cases covering registry wiring, dry-run semantics, and three regression guards against the Bug 1 re-introduction (no `process.execPath`, no `GBRAIN` constant, no `bun` or `.ts` in `execSync` calls).
+- Rewrote `test/autopilot-resolve-cli.test.ts` — the old test enshrined the buggy `.ts` return path. New test parameterizes argv/execPath combinations and asserts the resolver never returns a `.ts` path. This is the test that would have caught Bug 4 before it shipped.
+
+**Deferred (tracked for follow-up `/investigate` sessions)**
+- Bug 2 (pooler MaxClients), Bug 3 (partial-migration retry loop), Bug 5 (v0.14.0 registry gap), Bug 6/10 (duplicate graph edges), Bug 7 (doctor --fast), Bug 8 (autopilot-cycle stalls), Bug 9 (YAML colons), Bug 11 (brain_score breakdown). Each has grounded Codex findings documenting the real root cause and where prior diagnoses went wrong. Landing target: subsequent PR waves.
+
+## [0.15.2] - 2026-04-21
+
+## **Silent binaries are dead. Every bulk action now heartbeats.**
+## **Agents can tell the difference between "working" and "hung."**
+
+`gbrain doctor` on a 52K-page brain used to sit silent for 10+ minutes and then get killed by an agent timeout. The checks always completed when run by hand, but stdout buffered and agents saw nothing. The same pattern hit `embed`, `sync`, `import`, `extract`, `migrate`, and every orchestrator that shelled out to them — progress either went to stdout with `\r` rewrites that collapse when piped, or nowhere at all. v0.15.2 routes every bulk action through one shared reporter. Non-TTY default is plain human lines on stderr, one line per event. Agents that want structured progress flip `--progress-json` and get one JSON object per line.
+
+Progress events never touch stdout. Data and final summaries still go there. Script you wrote six months ago that parses `gbrain embed` output? Still works. Agent that captures stdout to JSON.parse the result? Now gets clean JSON instead of `\r\r\r1234/52000 pages...` mixed in.
+
+### The numbers that matter
+
+Measured on this repo (80 unit test files, 14 E2E test files, real Postgres+pgvector, 141 E2E cases incl. 3 new doctor-progress tests):
+
+| Metric                                            | BEFORE v0.15.2         | AFTER v0.15.2                          | Δ              |
+|---------------------------------------------------|------------------------|----------------------------------------|----------------|
+| Commands that stream progress                     | 3 (ad-hoc `\r` stdout) | **14** (reporter, stderr, rate-gated) | **+11**        |
+| Progress observable when stdout is piped          | **0 of 3**             | **14 of 14**                           | always visible |
+| Canonical JSON event schema                       | none                   | **locked in `docs/progress-events.md`** | stable         |
+| `doctor` silence window on 52K pages              | 10+ min then killed    | **heartbeat every 1s**                 | observable     |
+| `jsonb_integrity` scan targets                    | 4 (missed `page_versions.frontmatter`) | **5**   | matches `repair-jsonb` |
+| Minion jobs that update `job.progress`            | 0 bulk cores           | **embed** wired (import/sync/extract ready via callbacks) | DB-backed |
+| Unit tests for progress/CLI plumbing              | 0                      | **37** (progress + cli-options)        | +37            |
+| E2E tests for agent-visible progress              | 0                      | **3** (doctor-progress Tier 1)         | +3             |
+
+| Bulk command          | Progress today  | Progress after v0.15.2                                        |
+|-----------------------|-----------------|----------------------------------------------------------------|
+| `doctor`              | None (blocks)   | Per-check heartbeat, 1s on slow queries                        |
+| `orphans`             | Final summary   | Heartbeat while `NOT EXISTS` scan runs                         |
+| `embed`               | `\r` stdout     | Per-page stderr, `job.updateProgress` from Minions             |
+| `files sync`          | `\r` stdout     | Per-file stderr                                                |
+| `export`              | `\r` stdout     | Per-page stderr (newly in scope)                               |
+| `import`              | Per-100 stdout  | Per-file stderr, rate-gated                                    |
+| `extract` (fs + db)   | Ad-hoc stderr   | Canonical event schema, all paths                              |
+| `sync`                | Final summary   | Per-file ticks across delete/rename/import phases              |
+| `migrate --to ...`    | Per-50 stdout   | `migrate.copy_pages` + `migrate.copy_links` phases             |
+| `repair-jsonb`        | Final summary   | Per-column heartbeat (stdout stays JSON-clean for orchestrator)|
+| `check-backlinks`     | Final summary   | Heartbeat during the double-walk                               |
+| `lint`                | Per-file stdout | Per-file stderr, issues still on stdout                        |
+| `integrity auto`      | Own progress file | Unified reporter (file kept as resume marker)                |
+| `eval`                | None            | Per-query tick in single + A/B modes                           |
+| `apply-migrations`    | Inherited child output | Explicit flag propagation + stdio discipline             |
+
+Concrete agent win: on a 52K-page brain, `gbrain --progress-json doctor` emits ~10 events per second on stderr (start per check, heartbeats during the slow scan, finish per check) while `gbrain doctor --json` keeps stdout clean and JSON-parseable. The agent never sees silence longer than 1 second, and its stdout parser doesn't need to scrub progress garbage.
+
+### What this means for you
+
+If you run `gbrain` in CI, through a Minion worker, or inside any agent that captures stdout, this release means your downstream consumers stop guessing. Slow migrations announce themselves. Long imports name each file. `gbrain jobs get <id>` returns live `progress` for Minion-queued bulk work. The `gbrain doctor` warning you've been ignoring because it fires silently and then 10 minutes later tells you nothing is wrong becomes a 1-second heartbeat that proves it's working. If you're reading logs from a shell pipeline and prefer plain human lines, you don't need to do anything, that's the default for non-TTY stderr. Only add `--progress-json` when you want structured events.
+
+## To take advantage of v0.15.2
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Nothing mechanical is required.** v0.15.2 is purely additive to the CLI surface — no schema changes, no migration orchestrator, no data rewrites. Progress events start flowing the next time you invoke a bulk command.
+2. **To stream structured events to your agent:**
+   ```bash
+   gbrain --progress-json sync 2> progress.log
+   # or
+   gbrain doctor --progress-json --json > doctor.json 2> doctor.progress
+   ```
+3. **For Minion-queued jobs:**
+   ```bash
+   gbrain jobs submit embed
+   # while it runs:
+   gbrain jobs get <id>   # .progress is live-updated by the worker
+   ```
+4. **If `gbrain doctor` still looks hung** on a very large brain, check the CLI output for heartbeat lines. If they're missing, file an issue at https://github.com/garrytan/gbrain/issues with the command you ran, stdout/stderr samples, and output of `gbrain doctor --fast`.
+
+### Itemized changes
+
+#### Reporter (new, `src/core/progress.ts`)
+- Dependency-free. Modes: `auto` (TTY → `\r`-rewriting; non-TTY → plain lines), `human`, `json` (JSONL on stderr), `quiet`.
+- Rate gating: emits on whichever fires first: `minIntervalMs` (default 1000) or `minItems` (default `max(10, ceil(total/100))`). Final `tick` where `done === total` always emits.
+- `startHeartbeat(reporter, note)` helper for single long-running queries (doctor's `markdown_body_completeness`, `orphans` anti-join, `repair-jsonb` per-column UPDATE).
+- `child()` composes phase paths, `sync.import.<slug>`, not flat `<slug>`.
+- EPIPE defense on both sync throws and stream `'error'` events. Singleton module-level SIGINT/SIGTERM handler emits `abort` events for every live phase, one handler no matter how many reporters exist.
+
+#### CLI plumbing (`src/core/cli-options.ts`, `src/cli.ts`)
+- Global flags `--quiet`, `--progress-json`, `--progress-interval=<ms>` parsed before command dispatch.
+- `CliOptions` singleton (`getCliOptions`) reachable from every command without threading a new parameter through 20 handlers.
+- `OperationContext.cliOpts` extends shared-op dispatch, MCP callers see defaults, CLI callers see parsed flags.
+- `childGlobalFlags()` helper: appends the parent's flags to every `execSync('gbrain ...')` call in the migration orchestrators, so child progress matches parent mode.
+
+#### JSON event schema
+- Stable from v0.15.2, documented in `docs/progress-events.md`.
+- `{event, phase, ts}` always present. Optional: `total`, `done`, `pct`, `eta_ms`, `note`, `elapsed_ms`, `reason`. No fake totals when a query has no count.
+- Phases use `snake_case.dot.path`. Machine-stable. Agent parsers can group by phase prefix (all `doctor.*` events belong to one run).
+
+#### Backward-compat warnings
+Progress for `embed`, `files`, `export`, `extract`, `import`, `migrate-engine` moved from stdout to stderr. Stdout now carries only final summaries and `--json` payloads. Scripts that parsed `process.stdout` for progress lines (`\r  1234/52000 pages...`) see empty stdout for those counters; the data they actually want (the final "Embedded N chunks" summary) is still there. Point anything grepping stdout for progress at stderr instead.
+
+#### Minion handlers (`src/commands/jobs.ts`)
+- `embed` handler passes `job.updateProgress({done, total, embedded, phase})` as the `onProgress` callback. Primary Minion progress channel is DB-backed, readable via `gbrain jobs get <id>` or the `get_job_progress` MCP op. Stderr from `jobs work` stays coarse for daemon liveness.
+- Other handlers (`sync`, `extract`, `backlinks`, `autopilot-cycle`, `import`) have the callback plumbing ready from the core functions; wiring the remaining handlers is a follow-up.
+
+#### `gbrain doctor`
+- `jsonb_integrity` now scans 5 targets (adds `page_versions.frontmatter`), matching `repair-jsonb`'s surface. The old 4-target check missed one of the repair sites.
+- Per-check heartbeats so agents see `doctor.db_checks` starting, which check is in-flight, and `doctor.markdown_body_completeness` scanning.
+- No false totals: the `LIMIT 100` truncation check reports `heartbeat`, not `tick` with a fake count.
+
+#### Upgrade (`src/commands/upgrade.ts`)
+- Post-upgrade timeout bumped 300s → 1800s (30 min). Override via `GBRAIN_POST_UPGRADE_TIMEOUT_MS`. The old 300s cap killed v0.12.0 graph-backfill migrations on 50K+ brains; heartbeat wiring in v0.15.2 makes the long wait observable.
+
+#### CI guard
+- `scripts/check-progress-to-stdout.sh` greps `src/` for `process.stdout.write('\r...')` and fails `bun run test` if any regression lands.
+
+#### Tests
+- New: `test/progress.test.ts` (17 cases — mode resolution, rate gating, EPIPE paths, SIGINT singleton, child phase composition), `test/cli-options.test.ts` (18 cases — flag parsing, `--quiet` skillpack-check collision regression, global-flag strip-and-dispatch), `test/e2e/doctor-progress.test.ts` (3 cases, Tier 1 — spawns the real CLI against a real Postgres, asserts stderr JSONL matches the schema and stdout stays clean).
+## [0.15.1] - 2026-04-21
+
+## **Fix wave: 4 hot issues that blocked real brains, landed together.**
+## **PGLite survives macOS 26.3. Minions actually rescues SIGKILL'd jobs. Autopilot dashboards stop the 14.6s seqscan. `bun install -g` tells you when it's broken.**
+
+v0.15.1 is the hotfix wave on top of the v0.14.x stack (shell job type in v0.14.0, doctor DRY + `--fix` in v0.14.1, 8 deferred bug fixes in v0.14.2) plus v0.15.0 (llms.txt + AGENTS.md): four user-filed issues against v0.13.x, fixed and verified together, plus three scope expansions that close adjacent footguns. Upgrade is automatic. If `gbrain upgrade` runs clean, your brain gets faster and more reliable on the next sync cycle.
+
+### The numbers that matter
+
+The four issues this release closes, with measured impact:
+
+| Issue | Before v0.15.1 | After v0.15.1 | Δ |
+|-------|----------------|----------------|---|
+| #170 `SELECT * FROM pages ORDER BY updated_at DESC` on 31k rows (Postgres) | ~14.6s seqscan | <20ms index scan | ~700x |
+| #219 `max_stalled` default on `minion_jobs` | 3 (three rescues before dead, v0.14.2 set this) | 5 (four rescues before dead) | extra headroom for flaky deploys |
+| #219 existing waiting/active jobs with `max_stalled<5` | would still dead-letter earlier than expected | backfilled to 5 on upgrade | closes the pain today |
+| #218 `bun install -g github:garrytan/gbrain` postinstall failure | silent `|| true` | visible stderr warning with recovery URL | users know it's broken |
+| #223 PGLite WASM crash on macOS 26.3 | raw `Aborted()`, no hint | pinned `@electric-sql/pglite` to `0.4.3` + actionable error message naming the issue | users can route to #223 |
+
+### What this means for you
+
+If you run autopilot against a Supabase brain with 30k+ pages, your health/dashboard cycle was silently burning 14.6 seconds on every iteration. The new index drops that to single-digit milliseconds without locking writes (Postgres gets `CREATE INDEX CONCURRENTLY` with an invalid-index cleanup DO block; PGLite gets plain `CREATE INDEX` since it has no concurrent writers). Your agent stops blocking on list-pages-by-date queries.
+
+If you use Minions, the "SIGKILL mid-flight, 10/10 rescued" claim is now actually true out-of-the-box with generous headroom. Default `max_stalled=5` means a kill -9'd worker gets picked up by the next worker instead of dead-lettered early. v15 migration backfills existing non-terminal rows (`waiting/active/delayed/waiting-children/paused`) so upgrading doesn't leave a queue full of doomed jobs.
+
+If you install via `bun install -g github:...` (not recommended but people try it), you'll now see a loud stderr warning with a link to #218 instead of a broken CLI that fails on next invocation. The real fix is `git clone + bun link`, documented in README and INSTALL_FOR_AGENTS.md.
+
+If you're on macOS 26.3 and PGLite was crashing with `Aborted()`, the pin to 0.4.3 gives us the best shot at avoiding the WASM regression (noting: 0.4.3 is unverified against 26.3 in CI — the error-wrap at `pglite-engine.ts connect()` is the safety net if the pin doesn't hold). Any PGLite init failure now shows the #223 link instead of a raw runtime error.
+
+## To take advantage of v0.15.1
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the outcome:**
+   ```bash
+   psql "$DATABASE_URL" -c "\d minion_jobs" | grep max_stalled  # DEFAULT should be 5
+   psql "$DATABASE_URL" -c "\d pages" | grep idx_pages_updated_at_desc  # index should exist
+   gbrain doctor
+   ```
+3. **If any step fails or the numbers look wrong,** file an issue with `gbrain doctor` output and the contents of `~/.gbrain/upgrade-errors.jsonl` if it exists. https://github.com/garrytan/gbrain/issues
+
+### Itemized changes
+
+#### Added
+- Schema migration **v14** — `CREATE INDEX [CONCURRENTLY] IF NOT EXISTS idx_pages_updated_at_desc ON pages (updated_at DESC)` (engine-aware; Postgres uses CONCURRENTLY with an invalid-index DO-block cleanup, PGLite uses plain CREATE). Closes #170. Contributed by @fuleinist (#215).
+- Schema migration **v15** — `ALTER TABLE minion_jobs ALTER COLUMN max_stalled SET DEFAULT 5` (bumps v0.14.2's default of 3 to 5 for extra flaky-deploy headroom) + `UPDATE` backfill scoped to non-terminal statuses (`waiting/active/delayed/waiting-children/paused`) so existing queued work benefits on upgrade. Closes #219. Reported by @macbotmini-eng.
+- `MinionJobInput.max_stalled` — new optional field, plumbed through `queue.add()` with `[1, 100]` clamp.
+- `gbrain jobs submit --max-stalled N` — CLI flag to set per-job stall tolerance.
+- `gbrain jobs submit --backoff-type`, `--backoff-delay`, `--backoff-jitter`, `--timeout-ms`, `--idempotency-key` — scope-expansion audit exposing existing `MinionJobInput` fields as first-class CLI flags.
+- `gbrain jobs smoke --sigkill-rescue` — opt-in regression smoke case that simulates a killed worker and asserts the v0.15.1 default actually rescues.
+- `gbrain doctor --index-audit` — new opt-in Postgres check that reports zero-scan indexes from `pg_stat_user_indexes`. Informational only (no auto-drop). PGLite no-ops.
+- `BrainEngine.kind` readonly discriminator (`'postgres' | 'pglite'`) — lets migrations and consumers branch on engine without `instanceof` + dynamic imports.
+- `package.json trustedDependencies: ["@electric-sql/pglite"]` — lets Bun run PGLite's dep postinstall on global installs.
+
+#### Changed
+- `@electric-sql/pglite` pinned to exactly `0.4.3` (was `^0.4.4`) — best-available mitigation for the macOS 26.3 WASM abort. Reported by @AndreLYL (#223). Flagged as unverified; reproduce on a 26.3 machine and file a follow-up if it still aborts.
+- `package.json postinstall` — now warns loudly on stderr with a recovery URL instead of silencing errors with `2>/dev/null || true`. `bun install -g` hitting a migration failure now tells you what to do. Reported by @gopalpatel (#218).
+- `src/core/pglite-engine.ts connect()` — wraps `PGlite.create()` with a friendly error pointing at #223 and `gbrain doctor`. Nests the original error for debuggability.
+- `doctor` `schema_version` check — now fails loudly when `version=0` (migrations never ran), linking #218.
+- `README.md` + `INSTALL_FOR_AGENTS.md` — explicit warning against `bun install -g github:garrytan/gbrain`.
+
+#### Fixed
+- **The "SIGKILL mid-flight, 10/10 rescued" claim is now accurate** out-of-the-box with headroom (#219). Schema default 3 → 5.
+- **Autopilot dashboards stop blocking on list-pages queries** on 30k+ row Postgres brains (#170).
+- **PGLite error on macOS 26.3** is now actionable instead of a raw `Aborted()` (#223).
+- **`bun install -g` no longer produces a silently broken CLI** (#218) — postinstall surfaces failures.
+
+#### Internal
+- `Migration` interface extended with `sqlFor: { postgres?, pglite? }` + `transaction: boolean` fields. Runner picks the engine-specific SQL branch and (on Postgres only) bypasses `engine.transaction()` when `transaction: false` (required for CONCURRENTLY).
+- `scripts/check-jsonb-pattern.sh` extended with a CI guard against `max_stalled DEFAULT 1` regressing.
+- ~15 new unit tests covering max_stalled default/clamp/backfill/v14/v15 semantics. 3 regression tests pinned by IRON RULE.
+- `test/e2e/` now runs test files sequentially via `scripts/run-e2e.sh` to eliminate shared-DB races that caused ~3/5 runs to have 4-10 flaky fails. Every run post-fix: 13 files, 138 tests, 0 fails.
+
+## [0.15.0] - 2026-04-21
+
+## **GBrain now talks to LLMs the way modern docs sites do.**
+## **One URL, full context. Three files, zero drift.**
+
+Three new artifacts ship at the repo root: `llms.txt` (llmstxt.org-spec index), `llms-full.txt` (same map with core docs inlined, ~225KB, fits well under a 150k-token context window), and `AGENTS.md` (the non-Claude-agent operating protocol). All three are generator-driven. `scripts/build-llms.ts` reads a curated `scripts/llms-config.ts` and emits `llms.txt` + `llms-full.txt` deterministically; `AGENTS.md` is hand-written and uses relative links so it survives forks and rename. Every agent that clones GBrain now has a one-screen answer to "I just got here, what do I do?"
+
+README and `INSTALL_FOR_AGENTS.md` now point agents at `AGENTS.md` first. The old install prompt still works, but the leverage point, Codex's read of the plan, was that these files are invisible unless the install path references them. Fixed.
+
+### The numbers that matter
+
+Measured on this release:
+
+| Metric                                          | BEFORE                          | AFTER                            | Δ                          |
+|-------------------------------------------------|----------------------------------|-----------------------------------|----------------------------|
+| Agent entry points with clear install protocol  | 1 (CLAUDE.md, Claude Code only) | 3 (CLAUDE.md + AGENTS.md + llms.txt) | +non-Claude coverage       |
+| Docs referenced at a single canonical URL       | 0                               | 20 (across 5 H2 sections)        | index exists               |
+| Full-context fetch round-trips                  | ~20 (one per doc)               | 1 (`llms-full.txt`, 224 KB)      | ~20x fewer fetches         |
+| Tests guarding the doc index                    | 0                               | 7 (paths resolve, idempotent, spec shape, regen-drift, content contract, AGENTS mirror, size budget) | +7                         |
+| Pre-existing repo bugs found and fixed          | —                               | 1 (`git pull origin main` → `master`) | drive-by                   |
+
+The 7 tests enforce content contract: removing `skills/RESOLVER.md` or the Debugging H2 from the config fails `bun test`. Forgetting to rerun `bun run build:llms` after adding a new doc fails `bun test`. The size budget (600KB) fails `bun test` if `llms-full.txt` balloons.
+
+### What this means for you
+
+If you're running GBrain: nothing to do. Your agent already has CLAUDE.md. But next time you install GBrain on Codex, Cursor, or OpenClaw, the agent lands on `AGENTS.md` and walks the install without hunting. If you run a fork, regenerate with `LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork/main bun run build:llms` to rewrite URLs. If you publish GBrain docs alongside your own, `llms.txt` is the index; `llms-full.txt` is the drop-into-a-context-window bundle.
+
+Credit to Codex for catching that the original plan's AGENTS.md was underpowered, that the eng review missed a content-contract test, and that the install prompt was the real leverage point. Seven of the fifteen Codex findings landed directly in the plan; three went to user decision; five stayed as intentional NOT-in-scope.
+
+## To take advantage of this release
+
+`gbrain upgrade` does not need to do anything. These are new public files; existing installs pick them up on their next pull.
+
+1. **If you wrote a downstream fork:** regenerate with your URL base.
+   ```bash
+   LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork/main bun run build:llms
+   git add llms.txt llms-full.txt && git commit
+   ```
+2. **If you add a new doc under `docs/`:** add it to `scripts/llms-config.ts`, then
+   ```bash
+   bun run build:llms
+   bun test test/build-llms.test.ts
+   ```
+   CI blocks ship if these drift.
+3. **Verify it actually works:** ask a fresh LLM
+   ```
+   Fetch https://raw.githubusercontent.com/garrytan/gbrain/master/llms.txt and tell me
+   how I'd debug a broken live sync.
+   ```
+   Answer should cite `docs/GBRAIN_VERIFY.md`, `docs/guides/live-sync.md`, and `gbrain doctor`.
+
+### Itemized changes
+
+#### Added
+- `AGENTS.md` at repo root — ~45-line non-Claude-agent operating protocol. Install, read order, trust boundary, config/debug/migration pointers, fork instructions. Uses relative links so it survives renames.
+- `llms.txt` at repo root — llmstxt.org-spec index. H1 + blockquote + 5 required H2 sections (Core entry points, Configuration, Debugging, Migrations) plus an Operational tips block with `gbrain doctor`, `gbrain orphans`, `gbrain repair-jsonb`. ~4KB.
+- `llms-full.txt` at repo root — same index with core docs inlined under `## {path}` headings for single-fetch ingestion. ~225KB, under the 600KB `FULL_SIZE_BUDGET`.
+- `scripts/llms-config.ts` — curated TS config. `LLMS_REPO_BASE` env var lets forks regenerate with their own URL base. `includeInFull: false` flags entries that should appear in `llms.txt` but not be inlined in `llms-full.txt` (Philosophy, Optional, CHANGELOG).
+- `scripts/build-llms.ts` — the generator. Deterministic, no timestamps, sorted by config order. Warns (does not fail) if `llms-full.txt` exceeds `FULL_SIZE_BUDGET` with the biggest entries listed.
+- `test/build-llms.test.ts` — 7 cases: paths resolve on disk, generator idempotent, llms.txt spec shape, checked-in files match generator output (drift guard), content contract (RESOLVER / AGENTS / INSTALL_FOR_AGENTS referenced), AGENTS mirrors README+INSTALL install path, size budget enforcement.
+- `bun run build:llms` script in `package.json`.
+
+#### Changed
+- `README.md` — adds a one-line LLMs/Agents pointer above the install CTA and a follow-up paragraph under the agent paste block naming `AGENTS.md` + `llms.txt` as fallback entry points for non-Claude agents.
+- `INSTALL_FOR_AGENTS.md` — new "Step 0: If you are not Claude Code" prelude points agents at `AGENTS.md` first.
+- `CLAUDE.md` — adds `scripts/llms-config.ts`, `scripts/build-llms.ts`, and `AGENTS.md` to Key files. Explicitly notes that committed generator output is NOT analogous to `schema-embedded.ts` (no runtime consumer; committed for GitHub browsing + fork safety).
+
+- `INSTALL_FOR_AGENTS.md:136` — `git pull origin main` → `git pull origin master`. Pre-existing drift: README and CI use `master`, `origin/HEAD -> master`, but the upgrade instructions told users to pull from a branch that doesn't exist. Folded into this release as a drive-by fix.
+
 ## [0.14.2] - 2026-04-20
 
 ## **Eight deferred bugs, root-cause fixes, one clean wave.**
@@ -192,7 +598,7 @@ Your agent's feedback loops tighten. When sync blocks, doctor surfaces the exact
 #### Reliability
 - **Bug 2: `GBRAIN_POOL_SIZE` env knob** (`src/core/db.ts`, `src/commands/import.ts`). Honored by both the singleton pool and the parallel-import worker pool. Defaults to 10; lower for Supabase transaction pooler. `initPostgres` / `initPGLite` now wrap lifecycle in `try { ... } finally { await engine.disconnect() }`.
 - **Bug 3: Migration ledger centralization + wedge cap** (`src/commands/apply-migrations.ts`, `src/core/preferences.ts`). Runner owns all ledger writes. 3 consecutive partials = wedged, skipped with a loud message. New `--force-retry <version>` flag writes a `'retry'` marker without faking success. `complete` status never regresses. `appendCompletedMigration` is idempotent on double-complete.
-- **Bug 8: `max_stalled` default 1 → 3** (`src/core/schema-embedded.ts`, `src/core/pglite-schema.ts`, `src/schema.sql`). First lock-lost tick no longer dead-letters. `v0_14_0` Phase A ALTERs existing installs. `autopilot-cycle` handler yields to the event loop between phases so the worker's lock-renewal timer fires.
+- **Bug 8: `max_stalled` default 1 → 3** (`src/core/schema-embedded.ts`, `src/core/pglite-schema.ts`, `src/schema.sql`). First lock-lost tick no longer dead-letters. `v0_14_0` Phase A ALTERs existing installs. `autopilot-cycle` handler yields to the event loop between phases so the worker's lock-renewal timer fires. (v0.15.1 further bumps this to 5 and adds a non-terminal row backfill — see #219.)
 - **Bug 9: Sync gate + acknowledge mechanism** (`src/commands/sync.ts`, `src/commands/import.ts`, `src/core/sync.ts`). All 3 sync paths (incremental, full via `runImport`, `gbrain import` git continuity) gate `sync.last_commit` on no-failures. Failures append to `~/.gbrain/sync-failures.jsonl` with dedup key. New `gbrain sync --skip-failed` + `--retry-failed` flags. Doctor surfaces unacknowledged failures.
 
 #### Observability
@@ -203,7 +609,7 @@ Your agent's feedback loops tighten. When sync blocks, doctor surfaces the exact
 - **Bug 6/10: `jsonb_agg(DISTINCT ...)` in legacy `traverseGraph`** (`src/core/postgres-engine.ts`, `src/core/pglite-engine.ts`). Presentation-level dedup only — the schema continues to preserve per-`origin_page_id` / per-`link_source` provenance rows. Fixes duplicate edges like `works_at → companies/brex` appearing twice in `gbrain graph`.
 
 #### New migration
-- **Bug 5: `v0_14_0` migration registered** (`src/commands/migrations/v0_14_0.ts`). Phase A: `ALTER minion_jobs.max_stalled SET DEFAULT 3` (idempotent). Phase B: emits `pending-host-work.jsonl` entry pointing at `skills/migrations/v0.14.0.md` for shell-jobs adoption. Registered in `src/commands/migrations/index.ts`. `package.json` bumped to 0.14.2 (0.14.0 and 0.14.1 were taken by upstream during this branch's work).
+- **Bug 5: `v0_14_0` migration registered** (`src/commands/migrations/v0_14_0.ts`). Phase A: `ALTER minion_jobs.max_stalled SET DEFAULT 3` (idempotent). Phase B: emits `pending-host-work.jsonl` entry pointing at `skills/migrations/v0.14.0.md` for shell-jobs adoption. Registered in `src/commands/migrations/index.ts`.
 
 #### Tests
 - New: `test/traverse-graph-dedup.test.ts`, `test/sync-failures.test.ts`, `test/brain-score-breakdown.test.ts`, `test/migration-resume.test.ts`, `test/migrations-v0_14_0.test.ts`.
@@ -371,7 +777,7 @@ Three new migrations, all idempotent, apply automatically on `gbrain init` / upg
 - **Strict-mode default flip.** BrainWriter ships with `strict_mode=lint`. The flip to strict requires a 7-day soak + BrainBench regression ≤1pt + zero false-positive count.
 - **Sandboxed user plugins.** v0.13 ships builtins only. User-provided TS modules deferred pending a real isolation story (worker_threads or vm2) in a follow-on release.
 - **`openai_embedding` refactor.** Deferred to PR 1.5 post-flip; embedding is a hot path.
-- **Wintermute `claw-bridge`.** Adoption path is documentation-only this release.
+- **OpenClaw `claw-bridge`.** Adoption path is documentation-only this release.
 
 ### Tests
 
@@ -391,7 +797,7 @@ Three new migrations, all idempotent, apply automatically on `gbrain init` / upg
 Four subcommands: `check` (read-only report with `--json`, `--type`, `--limit`), `auto` (three-bucket repair with `--confidence`, `--review-lower`, `--dry-run`, `--fresh`, `--limit`), `review` (prints queue path + count), `reset-progress`. Nine bare-tweet phrase regexes. External-link extraction for optional dead-link probing. Repairs route through `BrainWriter.transaction`.
 
 #### BudgetLedger + CompletenessScorer (`src/core/enrichment/`)
-`BudgetLedger.reserve` returns `{kind:'held'}` or `{kind:'exhausted'}`. FOR UPDATE serializes concurrent reserves. `commit`, `rollback`, `cleanupExpired`. Midnight rollover via `Intl.DateTimeFormat` en-CA in configured IANA tz. Seven per-type rubrics + default (weights sum to 1.0). Person rubric's `non_redundancy` and `recency_score` kill Wintermute's length-only heuristic + 30-day-re-enrich-forever pathologies.
+`BudgetLedger.reserve` returns `{kind:'held'}` or `{kind:'exhausted'}`. FOR UPDATE serializes concurrent reserves. `commit`, `rollback`, `cleanupExpired`. Midnight rollover via `Intl.DateTimeFormat` en-CA in configured IANA tz. Seven per-type rubrics + default (weights sum to 1.0). Person rubric's `non_redundancy` and `recency_score` kill Garry's OpenClaw's length-only heuristic + 30-day-re-enrich-forever pathologies.
 
 #### Minions scheduler polish (`src/core/minions/`)
 `quiet-hours.ts` — pure `evaluateQuietHours(cfg, now?)`. Wrap-around windows. Unknown tz fails open. `stagger.ts` — FNV-1a → 0–59 deterministic across runtimes. `worker.ts` integrated: post-claim evaluation, defer → `delayed/+15m`, skip → `cancelled`.
@@ -758,7 +1164,7 @@ Your brain now wires itself. Every page write automatically extracts entity refe
 
 - **Auto-link on every page write.** When you `gbrain put` a page that mentions `[Alice](people/alice)` or `[Acme](companies/acme)`, those links land in the graph automatically. Stale links (refs no longer in the page text) are removed in the same call. Run a quick `gbrain put` and the brain knows who's connected to whom. To opt out: `gbrain config set auto_link false`.
 - **Typed relationships.** Inferred from context using deterministic regex (zero LLM calls): `attended` (meeting -> person), `works_at` (CEO of, VP at, joined as), `invested_in` (invested in, backed by), `founded` (founded, co-founded), `advises` (advises, board member), `source` (frontmatter), `mentions` (default). On a 80-page benchmark brain: 94% type accuracy.
-- **`gbrain extract --source db`.** New mode for the existing `gbrain extract <links|timeline|all>` command that walks pages from the engine instead of from disk. Works for live brains backed by Postgres or PGLite without a local markdown checkout — exactly what an MCP-driven Wintermute or OpenClaw setup needs. Filesystem mode (`--source fs`) is unchanged and still the default.
+- **`gbrain extract --source db`.** New mode for the existing `gbrain extract <links|timeline|all>` command that walks pages from the engine instead of from disk. Works for live brains backed by Postgres or PGLite without a local markdown checkout — exactly what an MCP-driven OpenClaw setup needs. Filesystem mode (`--source fs`) is unchanged and still the default.
 - **`gbrain graph-query <slug>` for relationship traversal.** "Who works at Acme?" → `gbrain graph-query companies/acme --type works_at --direction in`. "Who attended meetings with Alice?" → `gbrain graph-query people/alice --type attended --depth 2`. Returns typed edges with depth, not just nodes. Backed by a new `traversePaths()` engine method on both PGLite and Postgres with cycle prevention (no exponential blowup on cyclic subgraphs).
 - **Graph-powered search ranking.** Hybrid search now applies a small backlink boost after cosine re-scoring (`score *= 1 + 0.05 * log(1 + backlink_count)`). Well-connected entities surface higher in results. Works in both keyword-only and full hybrid paths. Tested on the new `test/benchmark-graph-quality.ts` (80 pages, 35 queries, A/B/C comparison) — relational query recall jumps from ~30% (search alone) to 100% (graph traversal).
 - **Graph health metrics in `gbrain health`.** New `link_coverage` and `timeline_coverage` percentages on entity pages (person/company), plus `most_connected` top-5 list. The `dead_links` field is dropped (always 0 under ON DELETE CASCADE — was a phantom metric). The `brain_score` composite formula stays but now reflects a sharper graph signal.
@@ -821,7 +1227,7 @@ CLI wrappers (`runExtract`, `runEmbed`, etc.) stay as thin arg-parsers that catc
 
 ### Added — skillify ships as a first-class gbrain skill
 
-Ported from Wintermute, proven in production. Paired with `gbrain check-resolvable` gives a user-controllable equivalent of Hermes' auto-skill-creation — you decide when and what, the tooling keeps the 10-item checklist honest.
+Ported from Garry's OpenClaw, proven in production. Paired with `gbrain check-resolvable` gives a user-controllable equivalent of Hermes' auto-skill-creation — you decide when and what, the tooling keeps the 10-item checklist honest.
 
 - `skills/skillify/SKILL.md` — the meta skill. Triggers: "skillify this", "is this a skill?", "make this proper".
 - `scripts/skillify-check.ts` — machine-readable audit. `--json` for CI, `--recent` to check files modified in the last 7 days.
@@ -989,7 +1395,7 @@ Wave 3 fixes were contributed by **@garagon** (PRs #105-#109) and **@Hybirdss** 
 | **cron-scheduler** | Schedule staggering (5-min offsets), quiet hours (timezone-aware with wake-up override), thin job prompts. | 21 cron jobs at :00 is a thundering herd. Staggering prevents it. Quiet hours mean no 3 AM notifications. Wake-up override releases the backlog. |
 | **reports** | Timestamped reports with keyword routing. "What's the latest briefing?" maps to the right report directory. | Cheap replacement for vector search on frequent queries. Don't embed. Load the file. |
 | **testing** | Validates every skill has SKILL.md with frontmatter, manifest coverage, resolver coverage. The CI for your skill system. | 3 skills and you need validation. 24 skills and you need it yesterday. Catches dead references, missing sections, MECE violations. |
-| **soul-audit** | 6-phase interview that generates SOUL.md, USER.md, ACCESS_POLICY.md, HEARTBEAT.md. Your agent's identity, built from your answers. | What makes Wintermute feel like Wintermute. Without personality and access control, every agent feels the same. |
+| **soul-audit** | 6-phase interview that generates SOUL.md, USER.md, ACCESS_POLICY.md, HEARTBEAT.md. Your agent's identity, built from your answers. | What makes your OpenClaw feel like yours. Without personality and access control, every agent feels the same. |
 | **webhook-transforms** | External events (SMS, meetings, social mentions) converted into brain pages with entity extraction. Dead-letter queue for failures. | Your brain ingests signals from everywhere. Not just conversations, but every webhook, every notification, every external event. |
 
 ### Infrastructure (new in v0.10.0)

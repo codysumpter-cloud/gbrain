@@ -6,6 +6,7 @@ import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
 import { serializeMarkdown } from './core/markdown.ts';
+import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
 import { VERSION } from './version.ts';
 
 // Build CLI name -> operation lookup
@@ -18,10 +19,16 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'apply-migrations', 'skillpack-check', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'providers']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'providers']);
 
 async function main() {
-  const args = process.argv.slice(2);
+  // Parse global flags (--quiet / --progress-json / --progress-interval)
+  // BEFORE command dispatch, so `gbrain --progress-json doctor` works.
+  // The stripped argv is what the command sees.
+  const rawArgs = process.argv.slice(2);
+  const { cliOpts, rest: args } = parseGlobalFlags(rawArgs);
+  setCliOptions(cliOpts);
+
   let command = args[0];
 
   if (!command || command === '--help' || command === '-h') {
@@ -148,6 +155,7 @@ function makeContext(engine: BrainEngine, params: Record<string, unknown>): Oper
     // Local CLI invocation — the user owns the machine; do not apply remote-caller
     // confinement (e.g., cwd-locked file_upload).
     remote: false,
+    cliOpts: getCliOptions(),
   };
 }
 
@@ -409,6 +417,11 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'jobs': {
         const { runJobs } = await import('./commands/jobs.ts');
         await runJobs(engine, args);
+        break;
+      }
+      case 'agent': {
+        const { runAgent } = await import('./commands/agent.ts');
+        await runAgent(engine, args);
         break;
       }
       case 'sync': {

@@ -173,7 +173,7 @@ board" — likely an advisor-role page prior plus verb-pattern combinations.
 
 **Cons:** Requires adding `sender_id` or `access_tier` to `OperationContext`. Each mutating operation needs a permission check. Medium implementation effort.
 
-**Context:** From CEO review + Codex outside voice (2026-04-13). Prompt-layer access control works in practice (same model as Wintermute) but is not sufficient for remote MCP where direct tool calls bypass the agent's prompt.
+**Context:** From CEO review + Codex outside voice (2026-04-13). Prompt-layer access control works in practice (same model as Garry's OpenClaw) but is not sufficient for remote MCP where direct tool calls bypass the agent's prompt.
 
 **Depends on:** v0.10.0 GStackBrain skill layer (shipped).
 

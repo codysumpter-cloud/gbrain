@@ -15,7 +15,7 @@
  * Returns JSON when --json is passed: { path, score, total, items,
  * recommendation }. Exit code is 0 when score == total, 1 otherwise.
  *
- * Ported from ~/git/wintermute/workspace/scripts/skillify-check.mjs
+ * Ported from ~/git/your-openclaw/workspace/scripts/skillify-check.mjs
  * (genericized: paths computed from $PROJECT_ROOT + runtime test-dir
  * detection; replaces the manual `grep AGENTS.md` check with a reference
  * to `gbrain check-resolvable` which validates the resolver better).
