@@ -4,8 +4,8 @@ All notable changes to GBrain will be documented in this file.
 
 ## [0.16.0] - 2026-04-20
 
-## **Durable agents land. Your LLM loops survive crashes, sleeps, and worker restarts now.**
-## **Laptop closed mid-run? Come back, resume where it died.**
+## **Durable agents land. Your LLM loops survive crashes, timeouts, and worker restarts now.**
+## **OpenClaw died mid-run? Come back, resume from the last committed turn.**
 
 Your OpenClaw crashes daily. Not "sometimes." Daily. An 8-turn OpenClaw subagent fires a tool call, the worker dies on a memory blip, all eight turns of context are gone, and there's nothing to do but start over from turn zero. This release kills that. `gbrain agent run` submits an Anthropic Messages API conversation as a first-class Minion job: every turn persists to `subagent_messages`, every tool call is a two-phase ledger row (`pending` → `complete | failed`), and replay on worker restart picks up from exactly the last committed turn. Crash-safe by construction, not by hope.
 
