@@ -19,7 +19,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'resolvers', 'integrity', 'repair-jsonb', 'orphans']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'dream']);
 
 async function main() {
   // Parse global flags (--quiet / --progress-json / --progress-interval)
@@ -358,6 +358,25 @@ async function handleCliOnly(command: string, args: string[]) {
     return;
   }
 
+  if (command === 'dream') {
+    // Dream mirrors doctor's pattern: filesystem phases run without a DB,
+    // so an engine connection failure is non-fatal. runCycle honestly
+    // reports DB phases as skipped when engine is null.
+    const { runDream } = await import('./commands/dream.ts');
+    let eng: BrainEngine | null = null;
+    try {
+      eng = await connectEngine();
+    } catch {
+      // DB unavailable — lint + backlinks still run against the brain dir.
+    }
+    try {
+      await runDream(eng, args);
+    } finally {
+      if (eng) await eng.disconnect();
+    }
+    return;
+  }
+
   // All remaining CLI-only commands need a DB connection
   const engine = await connectEngine();
   try {
@@ -557,6 +576,8 @@ TOOLS
   check-backlinks <check|fix> [dir]  Find/fix missing back-links across brain
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
   orphans [--json] [--count]         Find pages with no inbound wikilinks
+  dream [--dry-run] [--json]         Run the overnight maintenance cycle once (cron-friendly).
+                                     See also: autopilot --install (continuous daemon).
   report --type <name> --content ... Save timestamped report to brain/reports/
 
 JOBS (Minions)
