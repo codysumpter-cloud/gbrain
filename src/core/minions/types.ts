@@ -71,6 +71,8 @@ export interface MinionJob {
   max_children: number | null;
   timeout_ms: number | null;
   timeout_at: Date | null;
+  /** Per-job lock lease (ms, #4145). NULL = worker-global lockDuration default. */
+  lock_duration_ms: number | null;
   remove_on_complete: boolean;
   remove_on_fail: boolean;
   idempotency_key: string | null;
@@ -90,6 +92,14 @@ export interface MinionJob {
   started_at: Date | null;
   finished_at: Date | null;
   updated_at: Date;
+
+  /** Submission metadata, NOT a DB column: set only by MinionQueue.add()
+   *  when it returned an EXISTING row instead of inserting (idempotency
+   *  fast-path, backpressure cap-hit, or the ON CONFLICT zero-row fallback).
+   *  rowToMinionJob never sets it; absent on fresh inserts and on rows read
+   *  back later. Surfaces in `jobs submit`'s JSON output — intended and
+   *  additive, so scripts can tell a real dispatch from a coalesce. */
+  coalesced?: boolean;
 }
 
 // --- Input Types ---
@@ -120,6 +130,8 @@ export interface MinionJobInput {
   max_children?: number;
   /** Wall-clock per-job deadline in ms. Set on claim → timeout_at. Terminal on expire (no retry). */
   timeout_ms?: number;
+  /** Per-job lock lease in ms (#4145). Clamped to [5s,1h]; NULL/undefined → handler map, then worker default. INSERT-only: an idempotency-key re-submit never mutates the first submitter's lease. */
+  lock_duration_ms?: number;
   /** DELETE row on successful completion (after token rollup + child_done insert). */
   remove_on_complete?: boolean;
   /** DELETE row on terminal failure (after parent failure hook). */
@@ -128,6 +140,40 @@ export interface MinionJobInput {
   max_spawn_depth?: number;
   /** Global dedup key. Same key returns the existing job, no second row created. */
   idempotency_key?: string;
+  /** Submission backpressure: cap waiting jobs with this name before inserting
+   *  a new row. Scope is (name, queue, source), where source reads
+   *  data.sourceId ?? data.source_id; a submission with NO source key counts
+   *  ALL rows for (name, queue) — the NULL-as-wildcard arm is intentional and
+   *  relied on by existing rate-cap callers. For single-flight semantics see
+   *  maxPending (exact scoping, counts in-flight work too). */
+  maxWaiting?: number;
+  /** Submission single-flight: cap PENDING jobs — waiting rows plus LIVE-LOCK
+   *  active rows (status='active' AND lock_until > now()) — for this
+   *  (name, queue, source) scope before inserting a new row. Expired-lock
+   *  actives belong to a dead/blocked worker and never count, so a wedged
+   *  worker cannot suppress dispatch (new waiting rows keep feeding the
+   *  waitingClaimable>0 wedge detectors); dead/cancelled/completed never
+   *  count either. Cap-hit returns the most-recent waiting row, else the
+   *  most-recent live-lock active row, stamped `coalesced: true`. Scope is
+   *  EXACT (unlike maxWaiting): COALESCE(data.sourceId, data.source_id)
+   *  compared with IS NOT DISTINCT FROM — a NULL-source submission matches
+   *  only NULL-source rows, never a wildcard. If both maxPending and
+   *  maxWaiting are supplied, both guards apply; maxPending is checked
+   *  first. Internal option (autopilot dispatch single-flight); not exposed
+   *  as a public submit flag yet — semantics exclude delayed/paused/
+   *  waiting-children rows deliberately. */
+  maxPending?: number;
+  /**
+   * Admission param-coalescing override. When unset, the per-name default
+   * (admission.ts PARAM_COALESCE_DEFAULT, config-overridable via
+   * minions.coalesce_params.<name>) applies — on for 'subagent'. When
+   * active, a parentless submit whose payload hash (sha256 of
+   * stable-stringified data, __owner_client_id INCLUDED so owner lanes never
+   * cross) matches a WAITING row for the same (name, queue) returns that row
+   * with `coalesced: true` instead of inserting a duplicate. Parented
+   * submits never coalesce regardless of this flag.
+   */
+  coalesce_params?: boolean;
 
   // v12: scheduler polish
   /**
@@ -158,6 +204,45 @@ export interface MinionWorkerOpts {
   stalledInterval?: number; // ms, default 30000
   maxStalledCount?: number; // default 1
   pollInterval?: number; // ms, default 5000 (for PGLite fallback)
+  /** RSS threshold in MB. When exceeded, worker triggers graceful shutdown
+   *  so a supervisor can respawn it. 0 or undefined = disabled. */
+  maxRssMb?: number;
+  /** Optional injection point for RSS readback. Defaults to
+   *  `() => process.memoryUsage().rss`. Tests inject deterministic sequences. */
+  getRss?: () => number;
+  /** Periodic RSS check interval in ms, default 60000. Catches the freeze
+   *  case where all concurrency slots are wedged with zero job completions
+   *  so the per-job check never fires. */
+  rssCheckInterval?: number;
+  /** Self-health-check interval in ms. 0 = disabled. Default: 60000 (1 minute).
+   *  Automatically disabled when running under a supervisor (GBRAIN_SUPERVISED=1).
+   *  Provides DB liveness probes and stall detection for bare `gbrain jobs work`
+   *  deployments managed by external process managers (systemd, Docker, cron). */
+  healthCheckInterval?: number;
+  /** Stall detection: ms of continuous idle (waiting>0, inFlight=0, no completions)
+   *  before emitting the first warning. Default: 300000 (5 minutes). */
+  stallWarnAfterMs?: number;
+  /** Stall detection: ms of continuous idle before emitting `'unhealthy'` with
+   *  reason='stalled'. Default: 600000 (10 minutes). Must be > stallWarnAfterMs. */
+  stallExitAfterMs?: number;
+  /** DB liveness probe: number of consecutive failed `SELECT 1` probes before
+   *  emitting `'unhealthy'` with reason='db_dead'. Default: 3. */
+  dbFailExitAfter?: number;
+  /** Per-probe wall-clock timeout in ms. A `SELECT 1` that hangs longer than
+   *  this counts as a failure (fed into dbFailExitAfter). Without this, a
+   *  hung probe would wedge the recursive setTimeout chain forever and
+   *  silently disable the health monitor. Default: 10000 (10 seconds). */
+  dbProbeTimeoutMs?: number;
+  /** issue #5: 'process' runs each claimed job in a SIGKILL-able child
+   *  process (blast radius = 1 job). Default 'inline' (today's behavior).
+   *  Requires childCliInvocation; the CLI layer resolves + validates it. */
+  jobIsolation?: 'inline' | 'process';
+  /** How to invoke the gbrain CLI for job children (resolved fail-fast at
+   *  worker startup by the CLI layer; structurally ChildCliInvocation from
+   *  job-isolation.ts — kept inline here to avoid an import cycle). */
+  childCliInvocation?: { cmd: string; argsPrefix: string[] } | null;
+  /** tini path for wrapping job children ('' = absent, direct spawn). */
+  childTiniPath?: string;
 }
 
 // --- Job Context (passed to handlers) ---
@@ -169,6 +254,12 @@ export interface MinionJobContext {
   attempts_made: number;
   /** AbortSignal for cooperative cancellation (fires on timeout, cancel, pause, or lock loss). */
   signal: AbortSignal;
+  /** Absolute wall-clock deadline (epoch ms) from the claim-time `timeout_at` stamp,
+   *  or null when the job has no per-job timeout. This is the DB's ground truth —
+   *  the same instant handleTimeouts() dead-letters against — so handlers that
+   *  spawn bounded sub-work (e.g. autopilot-cycle's subagent phases) can budget
+   *  from the REMAINING time instead of a fixed constant that may exceed it. */
+  deadlineAtMs: number | null;
   /** AbortSignal that fires only on worker process SIGTERM/SIGINT. Handlers sensitive
    *  to deploy restarts (e.g. the shell handler, which must run a SIGTERM → 5s → SIGKILL
    *  sequence on its child) listen to this in addition to `signal`. Most handlers can
@@ -306,6 +397,20 @@ export type TranscriptEntry =
   | { type: 'llm_turn'; model: string; tokens_in: number; tokens_out: number; ts: string }
   | { type: 'error'; message: string; stack?: string; ts: string };
 
+// --- Abort-reason literals (single source of truth) ---
+//
+// Per-job abort sites construct `new Error(REASON)`; classification sites
+// (worker.ts INFRASTRUCTURE_ABORT_REASONS, child-job-runner.ts
+// PER_JOB_ABORT_REASONS) match on the message. Deriving both sets from these
+// constants keeps a rename at an abort site from silently flipping child
+// classification (maintainability review).
+
+/** Infrastructure faults: released, no attempt burned; stall sweeper requeues. */
+export const ABORT_REASON_LOCK_RENEWAL_FAILED = 'lock-renewal-failed';
+export const ABORT_REASON_LOCK_LOST = 'lock-lost';
+/** Job-targeted aborts: keep their existing attempt semantics. */
+export const ABORT_REASON_TIMEOUT = 'timeout';
+
 // --- Errors ---
 
 /** Throw this from a handler to skip all retry logic and go straight to 'dead'. */
@@ -345,6 +450,7 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     depth: (row.depth as number) ?? 0,
     max_children: (row.max_children as number) ?? null,
     timeout_ms: (row.timeout_ms as number) ?? null,
+    lock_duration_ms: (row.lock_duration_ms as number) ?? null,
     timeout_at: row.timeout_at ? new Date(row.timeout_at as string) : null,
     remove_on_complete: row.remove_on_complete === true,
     remove_on_fail: row.remove_on_fail === true,
@@ -381,6 +487,12 @@ export interface SubagentHandlerData {
   /** Max assistant turns before the loop fails with stop_reason='max_turns'. */
   max_turns?: number;
   /**
+   * Per-turn max output tokens (#2778). Resolution: this field →
+   * `agent.max_output_tokens` config → 8192 default. The pre-#2778
+   * hardcoded 4096 made pages >~12KB unwritable via put_page.
+   */
+  max_tokens?: number;
+  /**
    * Whitelist of tool names the agent may call. MUST be a subset of the
    * derived registry names — invalid entries are rejected at tool-dispatch
    * time, not silently ignored. Empty array = no tools.
@@ -390,6 +502,104 @@ export interface SubagentHandlerData {
   system?: string;
   /** Template variables for subagent_def. Arbitrary JSON-serializable. */
   input_vars?: Record<string, unknown>;
+  /**
+   * Connected-gbrains brain id (v0.19+, PR 0 plumbing only).
+   *
+   * CURRENT BEHAVIOR: stamped onto every tool-call's `OperationContext.
+   * brainId` but NOT yet used to select an engine at dispatch time.
+   * `gbrain agent run` does not yet accept a `--brain` flag that would
+   * populate this field — all subagent jobs submitted by the CLI today
+   * default to the host engine. The field + handler acceptance exist so
+   * PR 1 can add the registry lookup + CLI flag in a single commit.
+   *
+   * FUTURE (PR 1): setting `brain_id: "yc-media"` at job submission will
+   * cause every tool call from the subagent to run against the yc-media
+   * engine via BrainRegistry.getBrain() at buildOpContext time.
+   */
+  brain_id?: string;
+  /**
+   * Trusted-workspace allow-list for put_page (v0.23 dream cycle).
+   *
+   * When set, the subagent's put_page calls are bounded to slugs matching
+   * any of these prefix globs (e.g. ["wiki/personal/reflections/*",
+   * "wiki/originals/*"]). When unset/empty, the legacy
+   * `wiki/agents/<subagentId>/...` namespace check applies.
+   *
+   * Trust comes from PROTECTED_JOB_NAMES gating subagent submission — MCP
+   * cannot reach this field. Only cycle.ts (synthesize/patterns phases)
+   * and direct CLI submitters set it.
+   */
+  allowed_slug_prefixes?: string[];
+  /**
+   * Brain source the subagent's tool calls are scoped to (#1586).
+   *
+   * When set, every tool-call `OperationContext.sourceId` uses this value
+   * instead of the legacy 'default', so put_page writes land in the cycle's
+   * resolved source. Same trust story as `allowed_slug_prefixes`:
+   * PROTECTED_JOB_NAMES gates subagent submission, so only cycle.ts and
+   * direct CLI submitters can set it. Validated via `validateSourceId` at
+   * tool-registry build time.
+   */
+  source_id?: string;
+  /**
+   * #4217 — when true, a job whose put_page writes were ALL attempted-and-
+   * failed FAILS (UnrecoverableError → dead, idempotency key released)
+   * instead of reporting `completed` with zero pages. Set by the dream
+   * synthesize + patterns fan-outs (jobs whose entire purpose is writing
+   * pages). Left unset for open-ended `gbrain agent run` jobs, where one
+   * rejected write plus a useful read-only answer is a legitimate
+   * completion — those still get truthful pages_* counts on the result.
+   * Same trust story as `allowed_slug_prefixes` (PROTECTED_JOB_NAMES).
+   */
+  require_writes?: boolean;
+  /**
+   * #4216 — synthesis execution mode. 'oneshot' = single structured
+   * completion + programmatic validated writes, falling back to the agentic
+   * loop in the SAME job when the output fails validation. Unset/'agentic'
+   * = the classic multi-turn tool loop. Trusted field (PROTECTED_JOB_NAMES);
+   * old binaries ignore it and run agentic — safe mixed-version degradation.
+   */
+  mode?: 'agentic' | 'oneshot';
+  /**
+   * #4216/CDX-9 — the exact transcript hash suffix every oneshot page slug
+   * must end with (`<hash6>` or `<hash6>-c<idx>` for chunked transcripts).
+   * The suffix is the idempotency boundary between transcripts; oneshot
+   * validation enforces it structurally instead of trusting prompt
+   * discipline. Set by the dream fan-out alongside `mode`.
+   */
+  oneshot_slug_suffix?: string;
+  /**
+   * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
+   * that `buildSystemPrompt()` splices into `system`. Default behavior
+   * (omitted or false) prepends a deterministic preamble listing each
+   * tool's name + usage_hint. Set to `true` to keep `system` byte-for-byte
+   * as provided.
+   *
+   * Use when the caller has hand-tuned a complete system prompt for a
+   * specific subagent (no benefit from auto-generated guidance, prompt
+   * cache hits ride entirely on the caller-supplied prefix).
+   */
+  system_no_tool_preamble?: boolean;
+  /**
+   * v0.41 E6 — opt OUT of classifier-gated auto-resubmit on terminal
+   * failures. Default behavior (omitted or false) runs the
+   * `RECOVERABLE_CLUSTERS` self-fix path when the failure classifies as
+   * one of {`prompt_too_long`, `tool_schema_mismatch`, `malformed_json`}.
+   * Set true to disable per-job (useful for graders / probes where a
+   * retry would muddy the signal).
+   */
+  no_self_fix?: boolean;
+  /**
+   * v0.41 E6 — internal marker set by `submitSelfFixChild` so the
+   * chain-depth walker can count self-fix ancestors. Counter starts at
+   * 0 on a fresh user-submitted job; increments by 1 per chain hop.
+   */
+  is_self_fix_child?: boolean;
+  /**
+   * v0.41 E6 — which classifier bucket triggered this self-fix child.
+   * Read by audit + diagnostic surfaces (jobs get / dashboard).
+   */
+  self_fix_cluster?: string;
 }
 
 /**
@@ -440,6 +650,20 @@ export interface ToolDef {
   input_schema: Record<string, unknown>;
   idempotent: boolean;
   execute(input: unknown, ctx: ToolCtx): Promise<unknown>;
+  /**
+   * v0.41 Approach C: one-line hint surfaced verbatim in the subagent
+   * system prompt's tool preamble. Tells the model WHEN to use this tool.
+   * The `description` tells the model HOW; the `usage_hint` tells WHEN.
+   *
+   * Field-report case: a `shell` tool sat in the registry and the subagent
+   * never used it because nothing told the model "to write a file, use
+   * shell." Per-tool hints surface that directly. Plugin authors get this
+   * affordance for free.
+   *
+   * Optional — omitted tools just don't get a hint line. Must be a single
+   * line (no embedded newlines) so the rendered preamble stays scannable.
+   */
+  usage_hint?: string;
 }
 
 /**
@@ -457,8 +681,20 @@ export type ContentBlock =
 export type SubagentStopReason =
   | 'end_turn'    // Anthropic says end_turn and last message has no tool_use
   | 'max_turns'   // hit max_turns budget before end_turn
+  | 'max_tokens'  // final turn hit the output-token cap — result text is TRUNCATED (#2778)
   | 'refusal'     // detected via stop_reason + content shape
   | 'error';      // unrecoverable (empty response retry exhausted, etc.)
+
+/**
+ * #4216 — why a oneshot attempt fell back to the agentic loop. Owned here
+ * (the lower layer) so subagent-oneshot.ts and the result type can never
+ * drift; 'no_put_page_tool' and 'too_many_pages' distinguish operator
+ * misconfiguration and contract overflow from model-output failures in the
+ * fallback_reasons telemetry.
+ */
+export type OneshotFallbackReason =
+  | 'unparseable' | 'length' | 'refusal' | 'bad_slug' | 'no_wikilink'
+  | 'empty_no_skip' | 'oneshot_timeout' | 'no_put_page_tool' | 'too_many_pages';
 
 /** Terminal result payload emitted by the subagent handler. */
 export interface SubagentResult {
@@ -475,4 +711,28 @@ export interface SubagentResult {
     cache_read: number;
     cache_create: number;
   };
+  /**
+   * #4217 structural write accounting, merged by finalizeWriteAccounting on
+   * every subagent job. attempted = settled rows only (complete + failed);
+   * pending rows count toward neither.
+   */
+  pages_attempted?: number;
+  pages_written?: number;
+  pages_failed?: number;
+  /**
+   * #4216 — which execution path produced this result: 'oneshot' (single
+   * structured call), 'agentic_fallback' (oneshot attempt failed validation,
+   * same job fell through to the loop), or 'agentic' (mode never requested
+   * oneshot). Absent on pre-wave results.
+   */
+  synth_mode_used?: 'oneshot' | 'agentic_fallback' | 'agentic';
+  /**
+   * #4216 — why the oneshot attempt fell back (only on synth_mode_used =
+   * 'agentic_fallback').
+   */
+  fallback_reason?: OneshotFallbackReason;
+  /** #4216 — slugs written by the oneshot path (operator visibility supplement). */
+  written_refs?: Array<{ slug: string; status: 'complete' | 'failed' }>;
+  /** #4216 — true when a retried oneshot job finalized from a prior invocation's ledger. */
+  recovered?: boolean;
 }

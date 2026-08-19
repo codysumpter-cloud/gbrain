@@ -7,6 +7,14 @@
  * 3. By type: no page type exceeds 60% of results
  * 4. By page: max N chunks per page (default 2)
  * 5. Compiled truth guarantee: ensure at least 1 compiled_truth chunk per page
+ *
+ * v0.18.0: every page key is composite (source_id, slug). Pre-v0.17 this
+ * was slug alone — under multi-source uniqueness that would collapse two
+ * same-slug pages in different sources into one, destroying recall.
+ * Codex review flagged this as a regression-critical path. The
+ * `pageKey()` helper below is the one canonical way to derive the key;
+ * every layer uses it so future "dedup just changed" drift is one file
+ * to fix.
  */
 
 import type { SearchResult } from '../types.ts';
@@ -14,6 +22,17 @@ import type { SearchResult } from '../types.ts';
 const COSINE_DEDUP_THRESHOLD = 0.85;
 const MAX_TYPE_RATIO = 0.6;
 const MAX_PER_PAGE = 2;
+
+/**
+ * Composite page key: (source_id, slug). Pre-v0.17 rows lacked source_id
+ * so we fall back to 'default' to preserve single-source brain behavior
+ * exactly. Post-v0.17 callers always populate source_id (SQL JOINs in
+ * pglite/postgres engine search paths).
+ */
+function pageKey(r: SearchResult): string {
+  const source = r.source_id ?? 'default';
+  return `${source}:${r.slug}`;
+}
 
 export function dedupResults(
   results: SearchResult[],
@@ -58,9 +77,10 @@ function dedupBySource(results: SearchResult[]): SearchResult[] {
   const byPage = new Map<string, SearchResult[]>();
 
   for (const r of results) {
-    const existing = byPage.get(r.slug) || [];
+    const k = pageKey(r);
+    const existing = byPage.get(k) || [];
     existing.push(r);
-    byPage.set(r.slug, existing);
+    byPage.set(k, existing);
   }
 
   const kept: SearchResult[] = [];
@@ -73,18 +93,28 @@ function dedupBySource(results: SearchResult[]): SearchResult[] {
 }
 
 /**
- * Layer 2: Remove chunks that are too similar to already-kept results.
- * Uses Jaccard similarity on word sets as a proxy for cosine similarity.
+ * Layer 2: Remove chunks that are too similar to already-kept results
+ * FROM THE SAME PAGE. Uses Jaccard similarity on word sets as a proxy for
+ * cosine similarity.
+ *
+ * v0.46.15 (#3983): the comparison is scoped to the same pageKey. The
+ * unscoped version dropped a chunk because a DIFFERENT page's chunk was
+ * textually similar — on near-duplicate-record corpora (many similar deal
+ * memos, weekly reports, boilerplate-heavy notes) that silently deleted
+ * whole PAGES from the result set. Distinct pages are distinct answers;
+ * only intra-page near-dups are redundant.
  */
 function dedupByTextSimilarity(results: SearchResult[], threshold: number): SearchResult[] {
   const kept: SearchResult[] = [];
+  const keptWordsByPage = new Map<string, Set<string>[]>();
 
   for (const r of results) {
     const rWords = new Set(r.chunk_text.toLowerCase().split(/\s+/));
+    const k = pageKey(r);
+    const samePageKept = keptWordsByPage.get(k) ?? [];
     let tooSimilar = false;
 
-    for (const k of kept) {
-      const kWords = new Set(k.chunk_text.toLowerCase().split(/\s+/));
+    for (const kWords of samePageKept) {
       const intersection = new Set([...rWords].filter(w => kWords.has(w)));
       const union = new Set([...rWords, ...kWords]);
       const jaccard = intersection.size / union.size;
@@ -97,6 +127,8 @@ function dedupByTextSimilarity(results: SearchResult[], threshold: number): Sear
 
     if (!tooSimilar) {
       kept.push(r);
+      samePageKept.push(rWords);
+      keptWordsByPage.set(k, samePageKept);
     }
   }
 
@@ -130,10 +162,11 @@ function capPerPage(results: SearchResult[], maxPerPage: number): SearchResult[]
   const kept: SearchResult[] = [];
 
   for (const r of results) {
-    const count = pageCounts.get(r.slug) || 0;
+    const k = pageKey(r);
+    const count = pageCounts.get(k) || 0;
     if (count < maxPerPage) {
       kept.push(r);
-      pageCounts.set(r.slug, count + 1);
+      pageCounts.set(k, count + 1);
     }
   }
 
@@ -145,30 +178,35 @@ function capPerPage(results: SearchResult[], maxPerPage: number): SearchResult[]
  * swap in the best compiled_truth chunk from the pre-dedup set (if one exists).
  */
 function guaranteeCompiledTruth(results: SearchResult[], preDedup: SearchResult[]): SearchResult[] {
-  // Group results by page
+  // Group results by composite page key (source_id, slug).
   const byPage = new Map<string, SearchResult[]>();
   for (const r of results) {
-    const existing = byPage.get(r.slug) || [];
+    const k = pageKey(r);
+    const existing = byPage.get(k) || [];
     existing.push(r);
-    byPage.set(r.slug, existing);
+    byPage.set(k, existing);
   }
 
   const output = [...results];
 
-  for (const [slug, pageChunks] of byPage) {
+  for (const [key, pageChunks] of byPage) {
     const hasCompiledTruth = pageChunks.some(c => c.chunk_source === 'compiled_truth');
     if (hasCompiledTruth) continue;
 
-    // Find the best compiled_truth chunk from pre-dedup input for this page
+    // Find the best compiled_truth chunk from pre-dedup input for this
+    // (source_id, slug) combination. Pre-v0.17 single-source match was
+    // "r.slug === slug"; now it's the composite key so two same-slug
+    // pages in different sources don't mistakenly swap chunks across.
     const candidate = preDedup
-      .filter(r => r.slug === slug && r.chunk_source === 'compiled_truth')
+      .filter(r => pageKey(r) === key && r.chunk_source === 'compiled_truth')
       .sort((a, b) => b.score - a.score)[0];
 
     if (!candidate) continue;
 
-    // Swap: replace the lowest-scored chunk from this page
+    // Swap: replace the lowest-scored chunk from this page (same
+    // composite key match).
     const lowestIdx = output.reduce((minIdx, r, idx) => {
-      if (r.slug !== slug) return minIdx;
+      if (pageKey(r) !== key) return minIdx;
       if (minIdx === -1) return idx;
       return r.score < output[minIdx].score ? idx : minIdx;
     }, -1);

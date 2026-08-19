@@ -21,6 +21,106 @@ import {
 } from '../core/search/eval.ts';
 
 export async function runEvalCommand(engine: BrainEngine, args: string[]): Promise<void> {
+  // v0.25.0 — sub-subcommand dispatch. Bare `gbrain eval --qrels ...`
+  // falls through to the legacy IR-metrics flow so existing callers
+  // don't break.
+  const sub = args[0];
+  if (sub === 'export') {
+    const { runEvalExport } = await import('./eval-export.ts');
+    return runEvalExport(engine, args.slice(1));
+  }
+  if (sub === 'prune') {
+    const { runEvalPrune } = await import('./eval-prune.ts');
+    return runEvalPrune(engine, args.slice(1));
+  }
+  if (sub === 'replay') {
+    const { runEvalReplay } = await import('./eval-replay.ts');
+    return runEvalReplay(engine, args.slice(1));
+  }
+  if (sub === 'gate') {
+    // v0.41 — eval gate. Two paths (regression via --baseline, correctness
+    // via --qrels). Needs an engine: correctness gate runs live retrieval;
+    // regression gate calls replayCore in-process (codex round-2 #7).
+    const { runEvalGate } = await import('./eval-gate.ts');
+    return runEvalGate(engine, args.slice(1));
+  }
+  if (sub === 'cross-modal') {
+    // No-DB sub-subcommand. The cli.ts dispatcher routes the user-facing
+    // path before connectEngine, so this branch only fires when callers
+    // already have an engine and re-enter via runEvalCommand. Engine is
+    // intentionally unused.
+    const { runEvalCrossModal } = await import('./eval-cross-modal.ts');
+    process.exit(await runEvalCrossModal(args.slice(1)));
+  }
+  if (sub === 'brainbench') {
+    // No-DB sub-subcommand: brainbench brings its own hermetic PGLite. The
+    // cli.ts dispatcher routes the user-facing path before connectEngine;
+    // this branch only fires on re-entry. Engine intentionally unused. The
+    // command owns its exit codes (0 pass / 1 regression / 2 error).
+    const { runEvalBrainBench } = await import('./eval-brainbench.ts');
+    await runEvalBrainBench(args.slice(1));
+    return; // unreachable — runEvalBrainBench always exits — but keeps control flow explicit
+  }
+  if (sub === 'code-retrieval') {
+    // v0.33.3 pre-w0 — code-retrieval baseline / gate harness. Needs a brain
+    // for the baseline (BaselineStrategy calls hybridSearch); --compare
+    // mode reads JSON only but the engine is already connected by this
+    // dispatcher.
+    const { runEvalCodeRetrieval } = await import('./eval-code-retrieval.ts');
+    return runEvalCodeRetrieval(engine, args.slice(1));
+  }
+  if (sub === 'retrieval-quality') {
+    // T6 — NamedThingBench. Gold query set vs hybrid retrieval; gates the
+    // families that ARE the retrieval-maxpool incident (title/alias/dilution).
+    const { runEvalRetrievalQuality } = await import('./eval-retrieval-quality.ts');
+    return runEvalRetrievalQuality(engine, args.slice(1));
+  }
+  if (sub === 'brainstorm') {
+    // v0.37.0 (D3 + codex r2 #11) — three-axis evaluation gate for the
+    // brainstorm + LSD wave. Engine connected (calls hybridSearch +
+    // listAllPageRefs for grounding signal). Exit code mirrors eval
+    // convention: 0 pass, 1 fail, 2 inconclusive.
+    const { runEvalBrainstorm } = await import('./eval-brainstorm.ts');
+    process.exit(await runEvalBrainstorm(engine, args.slice(1)));
+  }
+  if (sub === 'whoknows') {
+    // v0.33 two-layer eval gate (ENG-D2): hand-labeled fixture =
+    // quality, eval_candidates replay = regression. Pass criteria
+    // baked in (>=80% top-3 hit rate; >=0.4 Jaccard with sparseness fallback).
+    const { runEvalWhoknows } = await import('./eval-whoknows.ts');
+    process.exit(await runEvalWhoknows(engine, args.slice(1)));
+  }
+  if (sub === 'suspected-contradictions') {
+    // v0.32.6 — contradiction probe. Engine connected (calls hybridSearch +
+    // the eval_contradictions_cache + _runs tables). Matches the `replay`
+    // dispatch pattern.
+    const { runEvalSuspectedContradictions } = await import('./eval-suspected-contradictions.ts');
+    return runEvalSuspectedContradictions(engine, args.slice(1));
+  }
+  if (sub === 'trajectory') {
+    // v0.35.4 (T6) — chronological claim trajectory for an entity. Engine
+    // is connected; thin-client routing handled inside the command file.
+    const { runEvalTrajectory } = await import('./eval-trajectory.ts');
+    return runEvalTrajectory(engine, args.slice(1));
+  }
+  if (sub === 'conversation-parser') {
+    // v0.41.13.0 — fixture-corpus CI gate for the 12-pattern built-in
+    // registry + opt-in LLM polish/fallback. Pure-function eval; no
+    // DB access, no API keys when --no-llm is passed. Wired into
+    // bun run verify so built-in regressions block PRs.
+    const { runEvalConversationParser } = await import('./eval-conversation-parser.ts');
+    process.exit(await runEvalConversationParser(args.slice(1)));
+  }
+  // v0.32.3 search-lite — per-mode orchestrator + comparison report.
+  if (sub === 'run-all') {
+    const { runEvalRunAll } = await import('./eval-run-all.ts');
+    return runEvalRunAll(engine, args.slice(1));
+  }
+  if (sub === 'compare') {
+    const { runEvalCompare } = await import('./eval-compare.ts');
+    return runEvalCompare(args.slice(1));
+  }
+
   const opts = parseArgs(args);
 
   if (opts.help) {

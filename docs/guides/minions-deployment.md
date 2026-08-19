@@ -1,7 +1,7 @@
 # Minions Worker Deployment Guide
 
-Deploy `gbrain jobs work` so it stays running across crashes, reboots, and
-Postgres connection blips. Written for agents to execute line-by-line.
+Keep `gbrain jobs work` running across crashes, reboots, and Postgres
+connection blips. Written for agents to execute line-by-line.
 
 ## The problem
 
@@ -12,10 +12,161 @@ The persistent worker can die silently from:
 - Bun process crashes with no automatic restart.
 - Internal event-loop death (PID alive, worker loop stopped).
 
-When the worker dies, submitted jobs sit in `waiting` forever. Nothing in
-gbrain core auto-restarts the worker — that's what this guide wires up.
+When the worker dies, submitted jobs sit in `waiting` — indefinitely for
+most types; types with a waiting-TTL (`subagent` defaults to 48h, see the
+[queue operations runbook](queue-operations-runbook.md)) are eventually
+cancelled with an auditable reason rather than queueing forever. Either
+way the work doesn't happen. The canonical answer is
+`gbrain jobs supervisor` — a first-class CLI that spawns `gbrain jobs work`
+as a child and auto-restarts it on crash.
 
-## Variables used in this guide
+## Worker supervision
+
+### The canonical pattern
+
+`gbrain jobs supervisor` is an auto-restarting wrapper around
+`gbrain jobs work`. It writes a PID file, restarts the worker on crash
+with exponential backoff (1s → 60s cap), emits lifecycle events to an
+audit file, and drains gracefully on SIGTERM (35s worker-drain window
+before SIGKILL). Exit codes are documented so agents can branch on them.
+
+**Typical commands:**
+
+```bash
+# Start in the foreground (blocks; Ctrl-C to stop).
+gbrain jobs supervisor --concurrency 4
+
+# Start detached — returns {"event":"started","supervisor_pid":…} on stdout.
+gbrain jobs supervisor start --detach --json
+
+# Check liveness without reading log files.
+gbrain jobs supervisor status --json
+
+# Graceful stop (SIGTERM + drain wait + SIGKILL fallback).
+gbrain jobs supervisor stop
+
+# Optional: cap worker memory in MB (--max-rss). Without the flag the RSS
+# watchdog is still on, at a RAM-relative auto-sized cap.
+gbrain jobs supervisor --concurrency 4 --max-rss 4096
+```
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| 0 | Clean shutdown (SIGTERM/SIGINT received, worker drained) |
+| 1 | Max crashes exceeded (worker kept dying) |
+| 2 | Another supervisor holds the PID lock |
+| 3 | PID file unwritable (permission / path error) |
+| 4 | Queue-scoped DB lock lost mid-run (`LOCK_LOST` — exited rather than risk a split-brain) |
+
+An agent seeing exit=2 can safely treat it as "one is already running";
+exit=4 as "restart me — the DB lock refresh failed"; exit=1 should page
+a human.
+
+### Lowering scheduling priority (`--nice`)
+
+When the worker pool runs at full concurrency on a machine you also use
+interactively, it can drive the load average high enough to starve your
+shell. Cutting `--concurrency` throws away throughput. Reach for `--nice`
+instead — it lowers the job tree's CPU scheduling priority without touching
+width, so the work runs full-speed when the box is idle and yields when it
+isn't:
+
+```bash
+# Full concurrency, low priority. Propagates to the spawned worker and its
+# children (shell jobs, subagents) via OS niceness inheritance.
+gbrain jobs supervisor --concurrency 4 --nice 10
+
+# Equivalent for a bare worker, or set it durably in the environment.
+GBRAIN_NICE=10 gbrain jobs work --concurrency 4
+```
+
+`--nice` takes a POSIX value from `-20` (highest priority) to `19`
+(nicest/lowest); positive values need no privilege, negative values need
+root. `GBRAIN_NICE` is the env equivalent (the flag wins). Confirm the
+effective value with `gbrain jobs stats`, `gbrain jobs supervisor status
+--json`, or the `supervisor_niceness` check in `gbrain doctor` — the doctor
+check warns if what you asked for isn't what's actually running (e.g. a
+negative value denied without privilege, or an OS `RLIMIT_NICE` clamp). This
+is distinct from the concurrency / inflight cap and composes with it.
+
+### Per-job process isolation (`--job-isolation process`)
+
+By default all concurrency slots execute inside one worker process. A
+handler that ignores its abort signal can only be force-evicted — the
+promise is abandoned, still running, still holding connections and memory —
+and any worker exit destroys every in-flight job at once. With isolation on,
+each claimed job runs in its own child process: a stuck handler is
+group-SIGKILLed for real (group signaling under Bun falls back to POSIX
+`/bin/kill`; if that's unavailable the worker logs that isolation is
+degraded), a crash or OOM in a child takes that one job instead of all N,
+and the OS reclaims every leaked resource when the child dies:
+
+```bash
+# Recommended for long-running LLM-bound handlers (subagent):
+gbrain jobs supervisor --concurrency 4 --job-isolation process
+
+# Bare worker, or durably via env:
+GBRAIN_JOB_ISOLATION=process gbrain jobs work --concurrency 4
+```
+
+How it works: the worker keeps claim, lock renewal, and all result
+recording; the child (an internal `run-child` entrypoint of the same gbrain
+binary) re-validates the claim, runs the handler with its own small engine
+pool, and reports one atomic outcome file. Handler-error semantics are
+preserved across the boundary (unrecoverable → dead, rate-lease → no attempt
+burned, everything else → normal backoff). On worker shutdown children get
+the drain window to finish and report; a child killed before reporting is
+released with no attempt burned. If the worker dies hard, the orphaned child
+self-terminates via a parent-liveness watchdog and the stall sweeper
+requeues the job after lock expiry — the lock token fences the orphan's
+queue writes (result recording, progress, state transitions) into no-ops.
+The handler's own side effects (page writes through its engine) can still
+land until the watchdog stops the child; that window is the watchdog's
+poll + grace, not unbounded.
+
+Sizing notes:
+
+- **Connections:** each child opens its own small pools (read 3 by default,
+  override via `GBRAIN_JOB_CHILD_POOL_SIZE`; direct 1). Worked example at
+  concurrency 15: 15×(3+1) + the worker's 10+3 ≈ **73 client connections**
+  total — 55 ride the transaction-pooler lane (multiplexed, no extra server
+  backends) and 18 are lazy direct session-lane connections, each holding a
+  real server backend while open. Budget the pooler-lane count against your
+  pooler's client limit and the session-lane count against
+  `max_connections`.
+- **Memory:** `--max-rss` covers the WORKER process only in this mode
+  (handler memory lives in the children; the worker prints a note when both
+  are set). There is no per-child RSS cap yet — a runaway child is contained
+  only by host/container limits. Size host memory for concurrency × handler
+  footprint.
+- **Spawn cost:** ~0.3–1s per job (engine connect included) — noise for
+  long-running handlers, meaningful for sub-second ones (`lint`,
+  `backlinks`). Keep those inline or on a separate inline worker.
+- **Security note:** the child receives the job's lock token via env. It is
+  a *fencing* token (split-brain protection), not a secret — same-user env
+  already contains the database URL.
+- **Child CLI resolution:** the worker fail-fast validates the child CLI at
+  startup (compiled `gbrain` binary, bun-dev fallback, or the
+  `GBRAIN_JOB_CHILD_CLI` env override — the ops/test escape hatch). Three
+  consecutive child spawn/bootstrap failures self-exit the worker as
+  unhealthy (a deterministically broken child CLI) for process-manager
+  restart instead of burning attempts across the queue.
+
+### Which supervisor when?
+
+The supervisor solves in-process crash recovery. Platform-level
+supervision (systemd, Fly, Render) handles host-level failures. You
+usually want both.
+
+| Environment | Recommendation |
+|---|---|
+| **Container (Fly / Railway / Render / Heroku)** | `gbrain jobs supervisor` runs as PID 1. The platform restarts the container on OOM / host loss; supervisor restarts the worker on crash. See [Fly.io](#flyio) / [Render / Railway / Heroku](#render--railway--heroku). |
+| **Linux VM with systemd** | Two-layer recommended: systemd supervises `gbrain jobs supervisor`, which in turn supervises `gbrain jobs work`. Buys you automatic restart on reboot (systemd) plus fast crash recovery (supervisor). See [systemd](#systemd). |
+| **Dev laptop / macOS** | `gbrain jobs supervisor` in a terminal. Ctrl-C stops it. No system-level setup needed. |
+
+### Variables used in this guide
 
 Substitute these once before copy-pasting any snippet.
 
@@ -23,142 +174,122 @@ Substitute these once before copy-pasting any snippet.
 |---|---|---|
 | `$GBRAIN_BIN` | Absolute path to the `gbrain` binary | `$(command -v gbrain)` — often `/usr/local/bin/gbrain` or `~/.bun/bin/gbrain` |
 | `$GBRAIN_WORKER_USER` | OS user that owns the worker process | the same user that ran `gbrain init`; never `root` |
-| `$GBRAIN_WORKER_PID_FILE` | Worker PID + restart-epoch file | `/tmp/gbrain-worker.pid` (or `/var/run/gbrain/worker.pid` for systemd) |
-| `$GBRAIN_WORKER_LOG_FILE` | Worker log sink (stdout + stderr merged) | `/tmp/gbrain-worker.log` (or `/var/log/gbrain/worker.log`) |
 | `$GBRAIN_WORKSPACE` | `cwd` for shell jobs submitted by this deployment | absolute path, e.g. `/srv/my-brain` |
-| `$GBRAIN_ENV_FILE` | Secrets file sourced by crontab / systemd | `/etc/gbrain.env` (mode 600) |
+| `$GBRAIN_ENV_FILE` | Secrets file sourced by systemd / shell | `/etc/gbrain.env` (mode 600) |
 
-## Preconditions
+### Preconditions
 
-Run these before Step 1 of any option. Fail fast if something is wrong.
+Run these before any deployment step.
 
 ```bash
 # 1. gbrain is on PATH and resolves to an absolute location.
 command -v gbrain || { echo "gbrain not on PATH. Install, then retry."; exit 1; }
 
-# 2. DATABASE_URL points at reachable Postgres (or PGLite path exists).
+# 2. DATABASE_URL points at reachable Postgres.
+#    (Supervisor is Postgres-only. PGLite's exclusive file lock blocks the
+#    separate worker process. If `config.engine === 'pglite'` the CLI rejects
+#    with a clear error.)
 gbrain doctor --fast --json | jq '.checks[] | select(.name=="db_connectivity")'
 
-# 3. Schema is up to date. If version=0 or status=="fail", fix it first:
+# 3. Schema is up to date. If version=0 or status=="fail":
 #    gbrain apply-migrations --yes
 gbrain doctor --fast --json | jq '.checks[] | select(.name=="schema_version")'
 
-# 4. You have write access to at least one crontab mechanism.
-crontab -l >/dev/null 2>&1 && echo "user crontab OK"
-[ -w /etc/crontab ] && echo "/etc/crontab OK"
-
-# 5. If you plan to submit `shell` jobs, the WORKER process needs
-#    GBRAIN_ALLOW_SHELL_JOBS=1 (submitters do not). The handler is gated
-#    in registerBuiltinHandlers(); without the flag the worker startup
-#    line reads "shell handler disabled (...)".
+# 4. If you plan to submit `shell` jobs, pass --allow-shell-jobs to the
+#    supervisor (or export GBRAIN_ALLOW_SHELL_JOBS=1 before starting).
+#    Without the flag, the shell handler is disabled at worker startup.
 ```
 
-## Which option?
+## Agent usage (OpenClaw / Hermes / Cursor / Codex)
 
-- Your workload runs LLM subagents (`gbrain agent run`) or jobs that take
-  > 30 s → **Option 1** (watchdog cron + persistent worker).
-- Your workload is short deterministic scripts on a fixed schedule (every
-  3 h, daily, weekly) → **Option 2** (inline `--follow`).
-- You don't have shell access to a long-running box (Fly/Render/Railway,
-  or any systemd host) → **Option 3** (service manager — replaces cron).
-
-## Option 1: watchdog cron + persistent worker
-
-A 5-minute cron checks whether the worker process is alive **and** whether
-it has logged an internal shutdown since its last start. Restarts if either
-condition fails.
-
-### 1a. Install the env file (secrets stay out of crontab)
-
-Never paste `DATABASE_URL` or API keys into crontab. `/etc/crontab` is
-mode 644 (world-readable); user crontabs under `/var/spool/cron/` are
-readable by `root`. Use the shipped env-file template:
+Three-command pattern an agent can drive without shell archaeology:
 
 ```bash
-sudo install -m 600 -o $GBRAIN_WORKER_USER -g $GBRAIN_WORKER_USER \
+# Start (returns PIDs + pid_file on stdout as JSON, then detaches)
+gbrain jobs supervisor start --detach --json
+# → {"event":"started","supervisor_pid":1234,"pid_file":"/Users/you/.gbrain/supervisor-<brain-id>.pid","detached":true}
+
+# Check health (machine-parseable JSON, no log scraping)
+gbrain jobs supervisor status --json
+# → {"running":true,"supervisor_pid":1234,"last_start":"2026-04-23T15:30:22Z","crashes_24h":0, ...}
+
+# Stop cleanly (SIGTERM + 35s drain + SIGKILL fallback)
+gbrain jobs supervisor stop
+```
+
+Every lifecycle event (spawn, crash, backoff, health warning, max-crashes,
+shutdown) is also written to `${GBRAIN_AUDIT_DIR:-~/.gbrain/audit}/supervisor-YYYY-Www.jsonl`
+for historical inspection. `gbrain doctor` reads that file and surfaces
+a `supervisor` check in its health report.
+
+## Deployment: systemd
+
+For long-running Linux VMs with shell access.
+
+```bash
+# Create the worker user if it doesn't exist.
+sudo useradd --system --home "$GBRAIN_WORKSPACE" --shell /usr/sbin/nologin gbrain \
+  2>/dev/null || true
+sudo mkdir -p "$GBRAIN_WORKSPACE" && sudo chown gbrain:gbrain "$GBRAIN_WORKSPACE"
+
+# Install the env file (secrets stay out of the unit file).
+sudo install -m 600 -o gbrain -g gbrain \
   docs/guides/minions-deployment-snippets/gbrain.env.example /etc/gbrain.env
 sudoedit /etc/gbrain.env
+# Fill in DATABASE_URL, optional GBRAIN_ALLOW_SHELL_JOBS=1.
+
+# Install the unit file, substituting /srv/gbrain → your workspace path.
+sudo install -m 644 docs/guides/minions-deployment-snippets/systemd.service \
+  /etc/systemd/system/gbrain-worker.service
+sudo sed -i "s|/srv/gbrain|$GBRAIN_WORKSPACE|g" \
+  /etc/systemd/system/gbrain-worker.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now gbrain-worker
+sudo systemctl status gbrain-worker
+journalctl -u gbrain-worker -n 50
 ```
 
-Fill in the connection string and `GBRAIN_ALLOW_SHELL_JOBS=1` (if
-applicable). See
-[`gbrain.env.example`](./minions-deployment-snippets/gbrain.env.example)
-for the full list.
+The shipped unit file invokes `gbrain jobs supervisor` (not `gbrain jobs work`
+directly) so you get two-layer supervision: systemd restarts the supervisor
+on host reboot, supervisor restarts the worker on in-process crash.
 
-### 1b. Install the watchdog script
+`Restart=always` + `RestartSec=10s` handle the supervisor-level recovery.
+The unit runs as unprivileged `gbrain` with `PrivateTmp`, `ProtectSystem=strict`,
+and `ReadWritePaths=$GBRAIN_WORKSPACE,$HOME/.gbrain` (for the PID file and
+audit log). `LimitNOFILE=65535` covers Bun + Postgres pool + concurrent
+LLM subagent calls without hitting the default 1024 cap.
 
-The [`minion-watchdog.sh`](./minions-deployment-snippets/minion-watchdog.sh)
-ships in-repo and writes a two-line PID file (PID on line 1, restart epoch
-on line 2). The restart-epoch marker is how the watchdog distinguishes
-stale shutdown lines in the log from current ones — without it, every tick
-after the first restart would match an old `worker shutting down` line and
-loop forever.
-
-Requires GNU coreutils (Linux default). On macOS/BSD install via
-`brew install coreutils` and alias `date` to `gdate` in the cron env if you
-want to test the watchdog locally; production Linux boxes work as-is.
+## Deployment: Fly.io
 
 ```bash
-sudo install -m 755 -o $GBRAIN_WORKER_USER -g $GBRAIN_WORKER_USER \
-  docs/guides/minions-deployment-snippets/minion-watchdog.sh \
-  /usr/local/bin/minion-watchdog.sh
+# Merge the [processes] block from fly.toml.partial into your fly.toml.
+cat docs/guides/minions-deployment-snippets/fly.toml.partial >> fly.toml
+# Review + edit as needed.
+
+# Set secrets (Fly handles restart on crash).
+fly secrets set DATABASE_URL='postgres://…' GBRAIN_ALLOW_SHELL_JOBS=1
 ```
 
-### 1c. Wire into cron
+The `[processes]` block runs `gbrain jobs supervisor` as PID 1. Fly
+restarts the container on host failure; the supervisor restarts the
+worker on in-process crash.
 
-Pick the form that matches the crontab you're editing.
+## Deployment: Render / Railway / Heroku
 
-**If you ran `crontab -e`** (user crontab — 5-field, no user column):
+Drop [`Procfile`](./minions-deployment-snippets/Procfile) at the repo
+root. The shipped Procfile calls `gbrain jobs supervisor`. Set
+`DATABASE_URL` + optional `GBRAIN_ALLOW_SHELL_JOBS=1` via the platform's
+env UI or CLI.
 
-```
-SHELL=/bin/bash
-PATH=/usr/local/bin:/usr/bin:/bin
-BASH_ENV=/etc/gbrain.env
-*/5 * * * * /usr/local/bin/minion-watchdog.sh
-```
+## Deployment: inline `--follow` (no persistent worker)
 
-**If you edited `/etc/crontab` directly** (system crontab — 6-field, with
-user column):
-
-```
-SHELL=/bin/bash
-PATH=/usr/local/bin:/usr/bin:/bin
-BASH_ENV=/etc/gbrain.env
-*/5 * * * * gbrain /usr/local/bin/minion-watchdog.sh
-```
-
-In both forms, `BASH_ENV=/etc/gbrain.env` tells non-interactive bash to
-source the env file before running the watchdog — that's how the
-connection string and `GBRAIN_ALLOW_SHELL_JOBS` reach the worker without
-landing in the world-readable crontab itself.
-
-### 1d. Log rotation
-
-The watchdog appends to the worker log across restarts. If you expect the
-file to grow unbounded, rotate it externally with `logrotate`:
-
-```
-# /etc/logrotate.d/gbrain-worker
-/tmp/gbrain-worker.log {
-  daily
-  rotate 7
-  missingok
-  notifempty
-  copytruncate
-}
-```
-
-`copytruncate` is important — the watchdog's restart-epoch check survives
-it (the epoch is compared against in-log timestamps, not file inode).
-
-## Option 2: inline `--follow` (no persistent worker)
-
-Each cron run brings its own temporary worker. `--follow` starts one on
-the queue and blocks until the just-submitted job reaches a terminal state
-(`completed` / `failed` / `dead` / `cancelled`). 2-3 s startup overhead
-per job; negligible vs job duration for scheduled work.
-
-Example: nightly brain enrichment as a shell job.
+For short deterministic scripts on a fixed schedule where you don't need
+a persistent worker between runs. Each cron run brings its own temporary
+worker. `--follow` starts one on the queue and blocks until the
+just-submitted job reaches a terminal state (`completed` / `failed` /
+`dead` / `cancelled`). 2-3 s startup overhead per job; negligible vs job
+duration for scheduled work.
 
 ```bash
 GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs submit shell \
@@ -170,130 +301,118 @@ GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs submit shell \
 
 Replace `gbrain embed --stale` with whichever gbrain subcommand you're
 scheduling (`sync`, `extract`, `orphans`, `doctor`, `check-backlinks`,
-`lint`, `autopilot`). If you're shelling out to a non-gbrain binary,
-keep its absolute path in the `cmd`.
-
-**Shared-queue gotcha.** If other jobs are already waiting on the same
-queue with higher priority or earlier `created_at`, the temporary worker
-processes those first before reaching yours. `--follow` still exits only
-when YOUR job finishes. For strict single-job semantics on shared queues,
+`lint`, `autopilot`). For strict single-job semantics on shared queues,
 use a dedicated queue name like `nightly-enrich` above.
 
-## Option 3: service manager (systemd / Fly / Render / Railway)
+## Upgrading from an older deployment
 
-Replaces the watchdog entirely. No cron, no PID file, no restart-loop.
-The service manager owns liveness.
+### From `minion-watchdog.sh`
 
-### systemd (Linux hosts with shell access)
+Earlier versions of this guide shipped a 68-line bash watchdog
+(`minion-watchdog.sh`). It's been replaced by `gbrain jobs supervisor`
+which handles everything the script did, plus atomic PID locking,
+structured audit events, queue-scoped health checks, and graceful
+drain on SIGTERM.
+
+**Migration:**
 
 ```bash
-# Create the worker user if it doesn't exist.
-sudo useradd --system --home "$GBRAIN_WORKSPACE" --shell /usr/sbin/nologin gbrain \
-  2>/dev/null || true
-sudo mkdir -p "$GBRAIN_WORKSPACE" && sudo chown gbrain:gbrain "$GBRAIN_WORKSPACE"
+# 1. Stop and remove the old watchdog.
+sudo kill $(head -n1 /tmp/gbrain-worker.pid) 2>/dev/null
+sudo rm -f /usr/local/bin/minion-watchdog.sh /tmp/gbrain-worker.pid \
+           /tmp/gbrain-worker.log
+crontab -e   # delete the "*/5 * * * * /usr/local/bin/minion-watchdog.sh" line
 
-# Install the unit file, substituting /srv/gbrain → your workspace path.
-sudo install -m 644 docs/guides/minions-deployment-snippets/systemd.service \
-  /etc/systemd/system/gbrain-worker.service
-sudo sed -i "s|/srv/gbrain|$GBRAIN_WORKSPACE|g" \
-  /etc/systemd/system/gbrain-worker.service
+# 2. Start the supervisor (systemd users: reinstall the unit from
+#    docs/guides/minions-deployment-snippets/systemd.service, which
+#    now calls `gbrain jobs supervisor`).
+gbrain jobs supervisor start --detach --json
+# Or: sudo systemctl restart gbrain-worker
 
-# See 1a above for /etc/gbrain.env install.
-sudo systemctl daemon-reload
-sudo systemctl enable --now gbrain-worker
-sudo systemctl status gbrain-worker
-journalctl -u gbrain-worker -n 50
+# 3. Verify.
+gbrain jobs supervisor status --json
+gbrain doctor   # 'supervisor' check should report running=true
 ```
 
-`Restart=always` + `RestartSec=10s` give you crash-loop recovery. The unit
-runs as an unprivileged `gbrain` user with `PrivateTmp`, `ProtectSystem=strict`,
-and `ReadWritePaths=$GBRAIN_WORKSPACE`. `LimitNOFILE=65535` in the shipped
-unit covers Bun + Postgres pool + concurrent LLM subagent calls without
-hitting the default 1024 cap.
+### Schema / migration hygiene
 
-### Fly.io
+Regardless of which deployment path you're upgrading from:
 
-Merge the `[processes]` block from
-[`fly.toml.partial`](./minions-deployment-snippets/fly.toml.partial) into
-your existing `fly.toml`. Set secrets with `fly secrets set` —
-Fly auto-restarts the process on crash.
-
-### Render / Railway / Heroku
-
-Drop [`Procfile`](./minions-deployment-snippets/Procfile) at the repo root.
-Set the connection string and `GBRAIN_ALLOW_SHELL_JOBS=1` via the
-platform's env UI or CLI.
-
-## Upgrading an existing deployment
-
-If you deployed on v0.13.x or earlier, walk this checklist:
-
-1. **Stop the worker before upgrading.**
-   `kill $(head -n1 /tmp/gbrain-worker.pid)` and wait for the process to
-   exit. Skipping this risks an in-flight job landing partial schema.
+1. **Stop the worker before upgrading.** `gbrain jobs supervisor stop`
+   (or `sudo systemctl stop gbrain-worker`). Skipping this risks an
+   in-flight job landing partial schema.
 2. **Run `gbrain upgrade`**. Then `gbrain apply-migrations --yes` if
    `gbrain doctor` reports any migration as `partial` or `pending`.
-3. **If you run shell jobs:** from v0.14 onward, the worker requires
-   `GBRAIN_ALLOW_SHELL_JOBS=1` to register the `shell` handler. Add it to
-   `/etc/gbrain.env`. Submitters don't need the flag; only the worker does.
-4. **If you tuned your watchdog for `max_stalled=1`:** v0.14.3 migration
-   v15 raised the schema default to 5 and backfilled existing non-terminal
-   rows. A watchdog tuned around 1-strike dead-lettering will now
-   over-restart because it takes 5 misses to dead-letter. Switch to the
-   shipped watchdog (which keys on log markers, not job state).
-5. **If your v0.16.1 watchdog is still running:** it has a restart-loop
-   bug (old shutdown lines in the unrotated log re-match every 5 min
-   forever). Install the current `minion-watchdog.sh` from this guide's
-   snippets — it writes a restart epoch into the PID file and only
-   considers log lines newer than that epoch.
-6. **Verify.** `gbrain doctor` should report zero `pending` or `partial`
-   migrations. `gbrain jobs stats` should show no unexplained growth in
-   `dead` between pre- and post-upgrade.
+3. **If you run shell jobs:** pass `--allow-shell-jobs` to the
+   supervisor (or keep `GBRAIN_ALLOW_SHELL_JOBS=1` in
+   `/etc/gbrain.env`). Submitters don't need the flag; only the worker
+   does.
+4. **Verify.** `gbrain doctor` should report zero `pending` or `partial`
+   migrations plus a healthy `supervisor` check. `gbrain jobs stats`
+   should show no unexplained growth in `dead` between pre- and
+   post-upgrade.
 
 ## Known issues
 
 ### Supabase connection drops
 
-The worker uses a single Postgres connection. If Supabase drops it
-(maintenance, connection limits, network blip), lock renewal fails
-silently. The stall detector then dead-letters the job after
-`max_stalled` misses.
+If Supabase drops the worker's Postgres connection (maintenance,
+connection limits, network blip), this now self-heals under the
+supervisor: the worker's DB-liveness probe self-exits (`db_dead`) on a
+dead pool and the supervisor respawns it with a fresh pool, and the
+supervisor also restarts a worker that stops making progress while
+claimable work waits. The escalation commands and thresholds live in the
+[queue operations runbook](queue-operations-runbook.md) — that's the
+canonical home for wedge recovery.
 
-**Current defaults that make this worse:**
+What can still bite is now narrow. Lock renewal is verify-before-evict:
+a thrown or timed-out renewal is never treated as loss — at the deadline
+the worker asks the database the authoritative question (one fenced
+re-check), so a starved-but-healthy job recovers its lease and keeps
+working. Eviction happens only on a fenced miss (the row was genuinely
+reclaimed — requeued with no attempt burned) or after a hard backstop
+(default 2× the lease) during a total outage. Long LLM handlers also get
+a 300 s lock lease by default (`HANDLER_DEFAULT_LOCK_DURATION_MS`)
+instead of the worker-global 30 s, and the stall sweep grants a 15 s
+reclaim grace so a just-recovered worker's renewal beats the sweep.
+The remaining exposure: a genuinely dead worker's long-lease job waits
+up to lease + grace + one sweep interval before requeue, and the stall
+detector still dead-letters after `max_stalled` genuine misses (schema
+column default 5).
 
-- `lockDuration: 30000` (30 s) — too short for long jobs during connection blips.
-- `max_stalled: 5` (schema column default on master — see `src/schema.sql`
-  and `src/core/pglite-schema.ts`). Five missed heartbeats before dead-letter.
-- `stalledInterval: 30000` (30 s) — checks too aggressively.
+Mixed-version fleets degrade gracefully: an old worker ignores the
+`lock_duration_ms` column and runs the legacy 30 s behavior; new workers
+honor old rows via the claim-time default. No drain or ordered restart
+is required.
 
-**Tune per-job today.** `gbrain jobs submit` accepts `--max-stalled N`,
+**Tune per-job.** `gbrain jobs submit` accepts `--max-stalled N`,
 `--backoff-type fixed|exponential`, `--backoff-delay <ms>`,
-`--backoff-jitter 0..1`, and `--timeout-ms N` as first-class flags
-(since v0.13.1). These write onto the job row at submit time — which is
-what `handleStalled()` reads — so per-job tuning is the real knob today.
-Worker-level `--lock-duration` / `--stall-interval` are on the roadmap;
-until they land, rely on per-job `--max-stalled` plus the watchdog (or
-systemd) for worker health.
+`--timeout-ms N`, `--lock-duration-ms N` (lock lease, clamped to
+[5 s, 1 h]), and `--backoff-jitter 0..1` as first-class flags.
+These write onto the job row at submit time — which is what
+`handleStalled()` and the renewal timer read — so per-job tuning is the
+real knob. The lock-renewal env knobs (incident escape hatches) are
+documented in the [queue operations runbook](queue-operations-runbook.md).
 
 ### DO NOT pass `maxStalledCount` to `MinionWorker`
 
 It's a no-op. The stall detector reads the row's `max_stalled` column
-(set at submit time), not the worker opt in `src/core/minions/worker.ts:74`.
+(set at submit time), not the worker opt in `src/core/minions/worker.ts`.
 Use `gbrain jobs submit --max-stalled N` per-job instead.
 
 ### Zombie shell children
 
 When the Bun worker crashes hard, child processes from shell jobs can
-become zombies. The watchdog's 10 s `SIGTERM → SIGKILL` window covers the
-shell handler's 5 s child-kill grace (`KILL_GRACE_MS`). For long-running
-shell jobs, bump the watchdog's `sleep 10` to `sleep 30` so the worker
-has time to flush in-flight jobs before the kill.
+become zombies. The supervisor's SIGTERM → 35s drain → SIGKILL window
+covers the shell handler's 5 s child-kill grace (`KILL_GRACE_MS`). For
+long-running shell jobs, prefer timeouts via `--timeout-ms` on submit
+over relying on hard kills.
 
 ## Smoke test
 
 ```bash
-# Worker alive?
-kill -0 $(head -n1 /tmp/gbrain-worker.pid) 2>/dev/null && echo ALIVE || echo DEAD
+# Supervisor alive?
+gbrain jobs supervisor status --json | jq .running
 
 # Aggregate queue health.
 gbrain jobs stats
@@ -304,20 +423,29 @@ gbrain jobs list --status active --limit 10
 # Dead-lettered jobs.
 gbrain jobs list --status dead --limit 10
 
-# Shell handler registered? (stderr banner merged into log via 2>&1.)
-grep "shell handler enabled" /tmp/gbrain-worker.log
+# Shell handler registered? (check supervisor audit log or worker stderr.)
+gbrain jobs supervisor status --json | jq '.worker_config.allow_shell_jobs'
 ```
 
 ## Uninstall
 
-- **Option 1 (watchdog cron):** `crontab -e`, delete the watchdog line.
-  `kill $(head -n1 /tmp/gbrain-worker.pid) && rm /tmp/gbrain-worker.pid`.
-  Optionally `sudo rm /etc/gbrain.env /usr/local/bin/minion-watchdog.sh`.
-- **Option 2 (inline `--follow`):** remove the cron entry. Nothing else to
-  clean up — temporary workers exit with their jobs.
-- **Option 3 (systemd):** `sudo systemctl disable --now gbrain-worker`,
-  then `sudo rm /etc/systemd/system/gbrain-worker.service /etc/gbrain.env`,
-  then `sudo systemctl daemon-reload`.
-- **Option 3 (Fly/Render/Railway):** delete the `worker` process from
-  `fly.toml` / `Procfile` and redeploy. Secrets set via `fly secrets`
-  persist until `fly secrets unset`.
+**`gbrain jobs supervisor`** (foreground or `--detach`):
+
+```bash
+gbrain jobs supervisor stop
+```
+
+**systemd:**
+
+```bash
+sudo systemctl disable --now gbrain-worker
+sudo rm /etc/systemd/system/gbrain-worker.service /etc/gbrain.env
+sudo systemctl daemon-reload
+```
+
+**Fly / Render / Railway:** delete the `worker` process from `fly.toml`
+/ `Procfile` and redeploy. Secrets set via `fly secrets` persist until
+`fly secrets unset`.
+
+**Inline `--follow`:** remove the cron entry. Nothing else to clean up
+— temporary workers exit with their jobs.

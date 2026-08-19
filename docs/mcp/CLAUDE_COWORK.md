@@ -12,7 +12,7 @@ For Team/Enterprise plans, an org Owner adds the connector:
    https://YOUR-DOMAIN.ngrok.app/mcp
    ```
 3. Add Bearer token authentication in Advanced Settings
-   (create one with `bun run src/commands/auth.ts create "cowork"`)
+   (create one with `gbrain auth create "cowork"`)
 4. Save
 
 Note: Cowork connects from Anthropic's cloud, not your device. Your server
@@ -26,6 +26,19 @@ Desktop bridges local MCP servers into Cowork via its SDK layer.
 
 This means: if `gbrain serve` is running and configured in Claude Desktop,
 you don't need a separate server for Cowork.
+
+## Verify
+
+In a Cowork session, try:
+
+```
+Call get_brain_identity, then search my brain for [any topic]
+```
+
+You should get pages from your brain back. If `list_skills` returns nothing,
+skill publishing is off on the host — enable it with
+`gbrain config set mcp.publish_skills true` (see
+[CLAUDE_CODE.md](CLAUDE_CODE.md) for the full gotcha).
 
 ## Which to use?
 

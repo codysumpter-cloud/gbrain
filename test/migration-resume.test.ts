@@ -18,15 +18,23 @@ import { tmpdir } from 'os';
 
 let tmpHome: string;
 const originalHome = process.env.HOME;
+const originalGbrainHome = process.env.GBRAIN_HOME;
 
 beforeEach(() => {
   tmpHome = mkdtempSync(join(tmpdir(), 'gbrain-migration-resume-'));
+  // preferences.ts's gbrainDir() delegates to gbrainPath(): GBRAIN_HOME is
+  // a PARENT dir with '.gbrain' appended, so GBRAIN_HOME=$tmpHome routes the
+  // ledger to `$tmpHome/.gbrain/migrations/`, matching the fixture layout.
+  // (HOME alone doesn't isolate — the fallback uses Bun's cached homedir().)
   process.env.HOME = tmpHome;
+  process.env.GBRAIN_HOME = tmpHome;
 });
 
 afterEach(() => {
   if (originalHome) process.env.HOME = originalHome;
   else delete process.env.HOME;
+  if (originalGbrainHome) process.env.GBRAIN_HOME = originalGbrainHome;
+  else delete process.env.GBRAIN_HOME;
   try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 

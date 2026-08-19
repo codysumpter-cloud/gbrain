@@ -25,9 +25,11 @@ mock.module('../../src/core/embedding.ts', () => ({
     // Deterministic fake vector for each chunk.
     return texts.map(() => new Float32Array(1536));
   },
+  // v0.41.31: embed phase reads the current signature to stamp provenance.
+  currentEmbeddingSignature: () => 'test:model:1536',
 }));
 
-const { runCycle } = await import('../../src/core/cycle.ts');
+const { runCycle, ALL_PHASES } = await import('../../src/core/cycle.ts');
 
 const skip = !hasDatabase();
 const describeE2E = skip ? describe.skip : describe;
@@ -61,7 +63,7 @@ describeE2E('E2E: runCycle against real Postgres', () => {
   beforeAll(async () => {
     await setupDB();
     repo = makeGitRepo();
-  });
+  }, 30_000);
 
   afterAll(async () => {
     await teardownDB();
@@ -97,8 +99,13 @@ describeE2E('E2E: runCycle against real Postgres', () => {
     });
 
     expect(report.schema_version).toBe('1');
-    // Cycle ran all 6 phases (or skipped the ones that don't support dry-run).
-    expect(report.phases.length).toBe(6);
+    // Every phase in ALL_PHASES pushes exactly one result (pack-gated phases
+    // like extract_atoms / synthesize_concepts push a 'skipped' result), so
+    // the full dry-run cycle's phase count always equals ALL_PHASES.length.
+    // Assert against the live constant rather than a hardcoded number so this
+    // doesn't go stale every time a phase is added (it drifted to 19 while the
+    // real count was 20 — the conversation_facts_backfill phase was missed).
+    expect(report.phases.length).toBe(ALL_PHASES.length);
 
     // Nothing got written.
     const afterPages = await conn.unsafe(`SELECT count(*)::int AS n FROM pages`);

@@ -13,6 +13,7 @@ import { describe, test, expect, beforeAll, afterAll, mock } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionWorker } from '../src/core/minions/worker.ts';
 import { registerBuiltinHandlers } from '../src/commands/jobs.ts';
+import { configureGateway, getChatModel, resetGateway } from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 let worker: MinionWorker;
@@ -118,5 +119,165 @@ describe('autopilot-cycle handler — partial failure does NOT throw', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  }, 30_000);
+});
+
+describe('autopilot-cycle handler — phase passthrough', () => {
+  test('refreshes DB-backed chat model config before a queued cycle runs', async () => {
+    const handler = (worker as any).handlers.get('autopilot-cycle');
+    expect(handler).toBeDefined();
+
+    const oldModel = await engine.getConfig('models.chat');
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      env: { ANTHROPIC_API_KEY: 'stale-key', OPENAI_API_KEY: 'fresh-key' },
+    });
+    await engine.setConfig('models.chat', 'openai:gpt-5');
+
+    try {
+      const result = await handler({
+        data: { phases: ['orphans'], pull: false },
+        signal: { aborted: false } as any,
+        job: { id: 9, name: 'autopilot-cycle' } as any,
+      });
+
+      expect(result).toBeDefined();
+      expect(getChatModel()).toBe('openai:gpt-5');
+    } finally {
+      resetGateway();
+      if (oldModel === null) {
+        await engine.unsetConfig('models.chat');
+      } else {
+        await engine.setConfig('models.chat', oldModel);
+      }
+    }
+  });
+
+  test('refreshes DB-backed chat model config before gateway-backed handlers validate job data', async () => {
+    const handler = (worker as any).handlers.get('enrich');
+    expect(handler).toBeDefined();
+
+    const oldModel = await engine.getConfig('models.chat');
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      env: { ANTHROPIC_API_KEY: 'stale-key', OPENAI_API_KEY: 'fresh-key' },
+    });
+    await engine.setConfig('models.chat', 'openai:gpt-5');
+
+    try {
+      await expect(handler({
+        data: {},
+        signal: { aborted: false } as any,
+        job: { id: 10, name: 'enrich' } as any,
+      })).rejects.toThrow('enrich Minion job requires data.sourceId');
+
+      expect(getChatModel()).toBe('openai:gpt-5');
+    } finally {
+      resetGateway();
+      if (oldModel === null) {
+        await engine.unsetConfig('models.chat');
+      } else {
+        await engine.setConfig('models.chat', oldModel);
+      }
+    }
+  });
+
+  test('job.data.phases restricts which phases run', async () => {
+    const fs = await import('fs');
+    const { execSync } = await import('child_process');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    const dir = fs.mkdtempSync(join(tmpdir(), 'gbrain-phase-pass-'));
+    try {
+      execSync('git init', { cwd: dir, stdio: 'pipe' });
+      execSync('git config user.email test@example.com', { cwd: dir, stdio: 'pipe' });
+      execSync('git config user.name Test', { cwd: dir, stdio: 'pipe' });
+      execSync('git commit --allow-empty -m init', { cwd: dir, stdio: 'pipe' });
+
+      const handler = (worker as any).handlers.get('autopilot-cycle');
+      // Request only lint and sync — embed should NOT appear
+      const result = await handler({
+        data: { repoPath: dir, phases: ['lint', 'sync'] },
+        signal: { aborted: false } as any,
+        job: { id: 10, name: 'autopilot-cycle' } as any,
+      });
+
+      expect(result).toBeDefined();
+      const report = (result as any).report;
+      expect(report).toBeDefined();
+      const phaseNames = report.phases.map((p: any) => p.phase);
+      expect(phaseNames).toContain('lint');
+      expect(phaseNames).toContain('sync');
+      // Phases NOT requested must be absent
+      expect(phaseNames).not.toContain('embed');
+      expect(phaseNames).not.toContain('extract');
+      expect(phaseNames).not.toContain('backlinks');
+      expect(phaseNames).not.toContain('orphans');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('invalid phase names in job.data.phases are filtered out', async () => {
+    const fs = await import('fs');
+    const { execSync } = await import('child_process');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    const dir = fs.mkdtempSync(join(tmpdir(), 'gbrain-phase-invalid-'));
+    try {
+      execSync('git init', { cwd: dir, stdio: 'pipe' });
+      execSync('git config user.email test@example.com', { cwd: dir, stdio: 'pipe' });
+      execSync('git config user.name Test', { cwd: dir, stdio: 'pipe' });
+      execSync('git commit --allow-empty -m init', { cwd: dir, stdio: 'pipe' });
+
+      const handler = (worker as any).handlers.get('autopilot-cycle');
+      // Mix valid and bogus names — only 'lint' should survive filtering
+      const result = await handler({
+        data: { repoPath: dir, phases: ['lint', 'BOGUS', 'rm -rf /'] },
+        signal: { aborted: false } as any,
+        job: { id: 11, name: 'autopilot-cycle' } as any,
+      });
+
+      const report = (result as any).report;
+      const phaseNames = report.phases.map((p: any) => p.phase);
+      expect(phaseNames).toContain('lint');
+      expect(phaseNames).not.toContain('BOGUS');
+      expect(phaseNames.length).toBe(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('empty phases array is an explicit no-op, never an implicit full run (#4250)', async () => {
+    const handler = (worker as any).handlers.get('autopilot-cycle');
+    // Pre-#4250 an explicitly-empty list silently fell through to ALL_PHASES —
+    // the "silently convert an empty payload into a full run" footgun. It is
+    // now an honest skip.
+    const result = await handler({
+      data: { repoPath: '/definitely-does-not-exist-for-phase-test', phases: [] },
+      signal: { aborted: false } as any,
+      job: { id: 12, name: 'autopilot-cycle' } as any,
+    });
+
+    expect(result.status).toBe('skipped');
+    expect(result.report.reason).toBe('empty_phase_list');
+    expect(result.report.phases_rejected_by_normalization).toEqual([]);
+  }, 30_000);
+
+  test('non-array phases value is ignored (falls back to all)', async () => {
+    const handler = (worker as any).handlers.get('autopilot-cycle');
+    // String instead of array — should be ignored
+    const result = await handler({
+      data: { repoPath: '/definitely-does-not-exist-for-phase-test', phases: 'lint' },
+      signal: { aborted: false } as any,
+      job: { id: 13, name: 'autopilot-cycle' } as any,
+    });
+
+    const report = (result as any).report;
+    const phaseNames = report.phases.map((p: any) => p.phase);
+    // Should have all phases since the string was ignored
+    expect(phaseNames).toContain('lint');
+    expect(phaseNames).toContain('sync');
+    expect(phaseNames).toContain('embed');
   }, 30_000);
 });

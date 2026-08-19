@@ -14,17 +14,28 @@ import {
 } from '../src/core/preferences.ts';
 
 let origHome: string | undefined;
+let origGbrainHome: string | undefined;
 let tmp: string;
 
 beforeEach(() => {
   origHome = process.env.HOME;
+  origGbrainHome = process.env.GBRAIN_HOME;
   tmp = mkdtempSync(join(tmpdir(), 'gbrain-prefs-test-'));
+  // preferences.ts's gbrainDir() delegates to config.ts's gbrainPath():
+  // GBRAIN_HOME is a PARENT dir and '.gbrain' is appended, so
+  // GBRAIN_HOME=$tmp routes prefs + the migration ledger to
+  // `$tmp/.gbrain/...`, matching the fixture layout. (HOME alone doesn't
+  // isolate: the unset-GBRAIN_HOME fallback uses os.homedir(), which Bun
+  // caches at first call and ignores in-process HOME mutation.)
   process.env.HOME = tmp;
+  process.env.GBRAIN_HOME = tmp;
 });
 
 afterEach(() => {
   if (origHome === undefined) delete process.env.HOME;
   else process.env.HOME = origHome;
+  if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = origGbrainHome;
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
@@ -200,5 +211,53 @@ describe('loadCompletedMigrations', () => {
     expect(entries.length).toBe(2);
     expect(entries[0].version).toBe('0.10.0');
     expect(entries[1].version).toBe('0.11.0');
+  });
+});
+
+describe('legacy $GBRAIN_HOME-direct layout copy-forward', () => {
+  // Before gbrainDir() delegated to gbrainPath(), a GBRAIN_HOME install kept
+  // prefs at $GBRAIN_HOME/preferences.json and the ledger at
+  // $GBRAIN_HOME/migrations/completed.jsonl (no '.gbrain' segment). The shim
+  // copies them forward on first read so an upgrade can't silently re-run
+  // completed migrations or drop an explicit minion_mode opt-out.
+
+  test('legacy ledger is copied forward and read under the new convention', () => {
+    mkdirSync(join(tmp, 'migrations'), { recursive: true });
+    writeFileSync(
+      join(tmp, 'migrations', 'completed.jsonl'),
+      JSON.stringify({ version: '0.11.0', status: 'complete' }) + '\n',
+    );
+    const entries = loadCompletedMigrations();
+    expect(entries.some((e) => e.version === '0.11.0' && e.status === 'complete')).toBe(true);
+    // Copied to the new path; legacy file retained for binary rollback.
+    expect(existsSync(join(tmp, '.gbrain', 'migrations', 'completed.jsonl'))).toBe(true);
+    expect(existsSync(join(tmp, 'migrations', 'completed.jsonl'))).toBe(true);
+  });
+
+  test('legacy preferences.json is copied forward — minion_mode opt-out survives the upgrade', () => {
+    writeFileSync(join(tmp, 'preferences.json'), JSON.stringify({ minion_mode: 'off' }) + '\n');
+    const prefs = loadPreferences();
+    expect(prefs.minion_mode).toBe('off');
+    expect(existsSync(join(tmp, '.gbrain', 'preferences.json'))).toBe(true);
+    expect(existsSync(join(tmp, 'preferences.json'))).toBe(true);
+  });
+
+  test('an existing new-path file wins — legacy is never copied over it', () => {
+    mkdirSync(join(tmp, '.gbrain'), { recursive: true });
+    writeFileSync(join(tmp, '.gbrain', 'preferences.json'), JSON.stringify({ minion_mode: 'always' }) + '\n');
+    writeFileSync(join(tmp, 'preferences.json'), JSON.stringify({ minion_mode: 'off' }) + '\n');
+    expect(loadPreferences().minion_mode).toBe('always');
+  });
+
+  test('a partial append does not shadow un-migrated legacy history', () => {
+    mkdirSync(join(tmp, 'migrations'), { recursive: true });
+    writeFileSync(
+      join(tmp, 'migrations', 'completed.jsonl'),
+      JSON.stringify({ version: '0.10.0', status: 'complete' }) + '\n',
+    );
+    appendCompletedMigration({ version: '0.11.0', status: 'partial' });
+    const entries = loadCompletedMigrations();
+    expect(entries.some((e) => e.version === '0.10.0' && e.status === 'complete')).toBe(true);
+    expect(entries.some((e) => e.version === '0.11.0' && e.status === 'partial')).toBe(true);
   });
 });

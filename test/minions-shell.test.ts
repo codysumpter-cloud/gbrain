@@ -12,8 +12,18 @@ import * as os from 'node:os';
 
 let engine: PGLiteEngine;
 let queue: MinionQueue;
+// The shell handler at src/core/minions/handlers/shell.ts:210 throws
+// UnrecoverableError when GBRAIN_ALLOW_SHELL_JOBS !== '1'. That's the
+// production-worker RCE guard. Unit tests here exercise the handler
+// mechanics, not the guard, so we enable it for the whole file and
+// restore on teardown. The separate "rejects when env not set" case
+// (in the minion-shell submission E2E / the queue-resilience wave)
+// toggles the var itself.
+let prevAllowShellJobs: string | undefined;
 
 beforeAll(async () => {
+  prevAllowShellJobs = process.env.GBRAIN_ALLOW_SHELL_JOBS;
+  process.env.GBRAIN_ALLOW_SHELL_JOBS = '1';
   engine = new PGLiteEngine();
   await engine.connect({ database_url: '' });
   await engine.initSchema();
@@ -22,6 +32,8 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  if (prevAllowShellJobs === undefined) delete process.env.GBRAIN_ALLOW_SHELL_JOBS;
+  else process.env.GBRAIN_ALLOW_SHELL_JOBS = prevAllowShellJobs;
 });
 
 beforeEach(async () => {
@@ -40,6 +52,7 @@ function makeCtx(
     data,
     attempts_made: 0,
     signal: opts.signal ?? new AbortController().signal,
+    deadlineAtMs: null,
     shutdownSignal: opts.shutdownSignal ?? new AbortController().signal,
     updateProgress: async () => {},
     updateTokens: async () => {},
@@ -269,12 +282,19 @@ describe('shell-audit: computeAuditFilename', () => {
 
 describe('shell-audit: write', () => {
   let tmpDir: string;
+  // #3554-sibling: the audit-dir preload sets GBRAIN_AUDIT_DIR once at
+  // process start; deleting it here (instead of restoring) let every file
+  // AFTER this one in the shard write audit fixtures to the operator's
+  // real ~/.gbrain/audit/ — and failed audit-dir-preload.test.ts whenever
+  // bin-packing placed it later in the shard. Restore the prior value.
+  const priorAuditDir = process.env.GBRAIN_AUDIT_DIR;
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shell-audit-test-'));
     process.env.GBRAIN_AUDIT_DIR = tmpDir;
   });
   afterAll(() => {
-    delete process.env.GBRAIN_AUDIT_DIR;
+    if (priorAuditDir === undefined) delete process.env.GBRAIN_AUDIT_DIR;
+    else process.env.GBRAIN_AUDIT_DIR = priorAuditDir;
   });
 
   test('GBRAIN_AUDIT_DIR env override resolves to the custom dir', () => {

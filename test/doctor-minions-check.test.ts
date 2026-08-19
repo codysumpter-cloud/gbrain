@@ -27,9 +27,19 @@ let origHome: string | undefined;
 function run(args: string[]): { exitCode: number; stdout: string; stderr: string } {
   // Strip DATABASE_URL so doctor runs filesystem-only for these tests.
   // Half-migrated checks run in the filesystem section; no DB needed.
-  const env = { ...process.env, HOME: tmp } as Record<string, string | undefined>;
+  // Both HOME and GBRAIN_HOME must point at the fixture dir: config/path
+  // resolution prefers GBRAIN_HOME (which the test preload sets to its own
+  // scratch), so HOME alone leaves the child reading the wrong .gbrain.
+  const env = { ...process.env, HOME: tmp, GBRAIN_HOME: tmp } as Record<string, string | undefined>;
   delete env.DATABASE_URL;
   delete env.GBRAIN_DATABASE_URL;
+  // Cross-file poisoning guard: sibling test files in the same bun process
+  // set process.env.GBRAIN_HOME (preferences, friction, bootstrap-* et al),
+  // and doctor resolves ~/.gbrain via resolveGbrainHome — which prefers
+  // GBRAIN_HOME over HOME. A leaked value makes the seeded
+  // $HOME/.gbrain/migrations fixture invisible and doctor exits 0 where the
+  // test expects the FAIL exit. Scrub it like the DB URLs above.
+  delete env.GBRAIN_HOME;
   try {
     const stdout = execFileSync('bun', ['run', CLI, ...args], {
       env: env as Record<string, string>,
@@ -146,7 +156,9 @@ describe('gbrain doctor — half-migrated Minions detection', () => {
 
   test('filesystem: multiple versions each need their own complete entry', () => {
     // v0.10 is fully migrated but v0.11 is only partial. Doctor should
-    // flag v0.11 by name.
+    // flag v0.11 by name. The forward-progress override only kicks in
+    // when a NEWER version completed; v0.10 is older than v0.11 so the
+    // partial still stands.
     const migrationsDir = join(tmp, '.gbrain', 'migrations');
     mkdirSync(migrationsDir, { recursive: true });
     writeFileSync(
@@ -166,9 +178,69 @@ describe('gbrain doctor — half-migrated Minions detection', () => {
     expect(minions!.message).not.toContain('0.10.0');
   });
 
+  test('filesystem: stale partial superseded by newer complete → NO warning (forward-progress override)', () => {
+    // v0.16.0 completed AFTER v0.11.0 went partial. The schema clearly
+    // advanced past v0.11.0, so the partial record is stale historical
+    // noise — not a real "MINIONS HALF-INSTALLED" condition.
+    //
+    // Without this override, every install that ever went through a
+    // v0.11.0 stopgap and then upgraded carries the FAIL flag forever,
+    // even on installs that have been at v0.22+ for months. Real cause:
+    // long-running gbrain installs accumulate partial entries from
+    // historical stopgap runs; a doctor flag with no time decay or
+    // forward-progress detection becomes meaningless once you've
+    // moved past those versions.
+    const migrationsDir = join(tmp, '.gbrain', 'migrations');
+    mkdirSync(migrationsDir, { recursive: true });
+    writeFileSync(
+      join(migrationsDir, 'completed.jsonl'),
+      [
+        JSON.stringify({ version: '0.16.0', status: 'complete', ts: '2026-04-26T06:13:50.825Z' }),
+        JSON.stringify({ version: '0.11.0', status: 'partial', ts: '2026-04-26T06:16:56.298Z' }),
+        JSON.stringify({ version: '0.11.0', status: 'partial', ts: '2026-04-26T06:19:03.617Z' }),
+      ].join('\n') + '\n',
+    );
+
+    const result = run(['doctor', '--fast', '--json']);
+    // No FAIL on minions_migration — the v0.11.0 partials are stale
+    // because v0.16.0 (a newer release) completed.
+    const checks = JSON.parse(result.stdout).checks as Array<{ name: string; status: string }>;
+    const minions = checks.find(c => c.name === 'minions_migration');
+    if (minions) {
+      expect(minions.status).not.toBe('fail');
+    }
+    // Critically: the test fixture would have caused exit 1 under the old
+    // (no-override) logic because of the stale partial flag. Under the new
+    // logic, doctor exits 0 (or only warns about non-related checks).
+    expect(result.exitCode).toBe(0);
+  });
+
+  test('filesystem: stale partial NOT superseded → still flagged', () => {
+    // The override only fires when a >= partial version has completed.
+    // Older completes (e.g. v0.10 complete + v0.16 partial) do NOT
+    // supersede the partial; the partial still indicates a real problem.
+    const migrationsDir = join(tmp, '.gbrain', 'migrations');
+    mkdirSync(migrationsDir, { recursive: true });
+    writeFileSync(
+      join(migrationsDir, 'completed.jsonl'),
+      [
+        JSON.stringify({ version: '0.10.0', status: 'complete' }),
+        JSON.stringify({ version: '0.16.0', status: 'partial' }),
+      ].join('\n') + '\n',
+    );
+
+    const result = run(['doctor', '--fast', '--json']);
+    expect(result.exitCode).toBe(1);
+    const checks = JSON.parse(result.stdout).checks as Array<{ name: string; status: string; message: string }>;
+    const minions = checks.find(c => c.name === 'minions_migration');
+    expect(minions!.status).toBe('fail');
+    expect(minions!.message).toContain('0.16.0');
+  });
+
   test('human output: prints MINIONS HALF-INSTALLED loud banner', () => {
     // Same fixture as the first test, but check the human-readable output
-    // includes the exact banner phrase Wintermute's cron script can grep for.
+    // includes the exact banner phrase an OpenClaw host's cron script
+    // can grep for.
     const migrationsDir = join(tmp, '.gbrain', 'migrations');
     mkdirSync(migrationsDir, { recursive: true });
     writeFileSync(
@@ -181,4 +253,37 @@ describe('gbrain doctor — half-migrated Minions detection', () => {
     expect(result.stdout).toContain('MINIONS HALF-INSTALLED');
     expect(result.stdout).toContain('gbrain apply-migrations --yes');
   });
+
+  test('DB-connect failure announces the filesystem-only fallback on stderr, credentials redacted', () => {
+    // The fallback used to be silent — indistinguishable from a healthy
+    // DB-backed run minus the DB checks. Pin the stderr note AND that a
+    // credential-bearing connect error never leaks the password (doctor
+    // output is what users paste into issues and CI logs).
+    const gbrainDir = join(tmp, '.gbrain');
+    mkdirSync(gbrainDir, { recursive: true });
+    // Assembled at runtime so the source never contains a scannable
+    // credential-URL span (the value is synthetic).
+    const fakeUrl = ['postgresql:/', '/alice:sekrit-hunter2', '@127.0.0.1:1/refused'].join('');
+    writeFileSync(
+      join(gbrainDir, 'config.json'),
+      JSON.stringify({ engine: 'postgres', database_url: fakeUrl }) + '\n',
+    );
+
+    // The shared run() helper discards stderr on exit 0; this pin needs it
+    // regardless of exit code, so spawn directly.
+    const env = { ...process.env, HOME: tmp, GBRAIN_HOME: tmp } as Record<string, string | undefined>;
+    delete env.DATABASE_URL;
+    delete env.GBRAIN_DATABASE_URL;
+    const { spawnSync } = require('child_process') as typeof import('child_process');
+    const res = spawnSync('bun', ['run', CLI, 'doctor', '--json'], {
+      env: env as NodeJS.ProcessEnv,
+      encoding: 'utf-8',
+      timeout: 60_000,
+    });
+    expect(res.stderr).toContain('[doctor] DB-backed doctor run failed');
+    expect(res.stderr).toContain('filesystem-only checks');
+    expect(res.stderr).not.toContain('sekrit-hunter2');
+    // stdout stays parseable JSON for --json consumers.
+    expect(() => JSON.parse(res.stdout.trim())).not.toThrow();
+  }, 60_000);
 });

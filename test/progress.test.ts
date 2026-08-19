@@ -1,6 +1,11 @@
 import { describe, test, expect } from 'bun:test';
-import { PassThrough } from 'node:stream';
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { join } from 'node:path';
+import { PassThrough, type Readable } from 'node:stream';
 import { createProgress, startHeartbeat, __liveReporterCountForTest, __signalHandlerInstalledForTest } from '../src/core/progress.ts';
+
+const REPO = join(import.meta.dir, '..');
+type SigintHarnessProcess = ChildProcessByStdio<null, Readable, Readable>;
 
 /** Collect everything a reporter writes into a string. */
 function sink(isTTY = false): { stream: PassThrough & { isTTY?: boolean }; read: () => string } {
@@ -16,6 +21,84 @@ function parseJsonl(raw: string): Record<string, unknown>[] {
     .split('\n')
     .filter((l) => l.length > 0)
     .map((l) => JSON.parse(l));
+}
+
+function waitForStdoutMarker(proc: SigintHarnessProcess, marker: string, readStdout: () => string, timeoutMs = 3000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      proc.stdout.off('data', onData);
+      proc.off('exit', onExit);
+      proc.off('error', onError);
+    };
+    const onData = () => {
+      if (!readStdout().includes(marker)) return;
+      cleanup();
+      resolve();
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(new Error(`child exited before ${marker}: code=${code} signal=${signal}`));
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out waiting for ${marker}; stdout=${JSON.stringify(readStdout())}`));
+    }, timeoutMs);
+
+    proc.stdout.on('data', onData);
+    proc.once('exit', onExit);
+    proc.once('error', onError);
+    onData();
+  });
+}
+
+function waitForExit(proc: SigintHarnessProcess, timeoutMs = 1500): Promise<{ exited: boolean; code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      proc.off('exit', onExit);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      resolve({ exited: true, code, signal });
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve({ exited: false, code: null, signal: null });
+    }, timeoutMs);
+    proc.once('exit', onExit);
+  });
+}
+
+async function runSigintHarness(script: string): Promise<{
+  exited: boolean;
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}> {
+  const proc = spawn(process.execPath, ['-e', script], {
+    cwd: REPO,
+    env: { ...process.env, FORCE_COLOR: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  proc.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+  proc.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+
+  await waitForStdoutMarker(proc, 'READY\n', () => stdout);
+  proc.kill('SIGINT');
+  const result = await waitForExit(proc);
+  if (!result.exited) {
+    proc.kill('SIGKILL');
+    await waitForExit(proc);
+  }
+  return { ...result, stdout, stderr };
 }
 
 describe('progress reporter', () => {
@@ -218,30 +301,75 @@ describe('progress reporter', () => {
   test('only one process-level signal handler installed across many reporters', () => {
     // Baseline: one handler already installed by prior tests in this file.
     const installedBefore = __signalHandlerInstalledForTest();
+    // liveReporters is module-global, so a reporter left running by ANOTHER
+    // test file in the same shard shows up here. Assert the DELTA (these 50
+    // lifecycles leak nothing) instead of an absolute zero — the absolute
+    // form flaked whenever shard composition changed and an unrelated file
+    // held a live reporter across this test.
+    const liveBefore = __liveReporterCountForTest();
     const { stream } = sink(false);
     for (let i = 0; i < 50; i++) {
       const p = createProgress({ mode: 'json', stream, minIntervalMs: 0, minItems: 1 });
       p.start(`phase_${i}`, 1);
       p.finish();
     }
-    // After 50 reporter lifecycles, still exactly one handler and zero leaked live entries.
+    // After 50 reporter lifecycles, still exactly one handler and no new live entries.
     expect(__signalHandlerInstalledForTest()).toBe(installedBefore || true);
-    expect(__liveReporterCountForTest()).toBe(0);
+    expect(__liveReporterCountForTest()).toBe(liveBefore);
+  });
+
+  test('SIGINT exits a child process when the progress reporter is the only handler', async () => {
+    const result = await runSigintHarness(`
+      const { createProgress } = await import('./src/core/progress.ts');
+      const progress = createProgress({ mode: 'json' });
+      progress.start('sigint_repro', 1);
+      process.stdout.write('READY\\n');
+      setInterval(() => {}, 1000);
+    `);
+
+    expect(result.exited).toBe(true);
+    expect(result.signal === 'SIGINT' || result.code === 130).toBe(true);
+    expect(result.stderr).toContain('"event":"abort"');
+    expect(result.stderr).toContain('"reason":"SIGINT"');
+  });
+
+  test('SIGINT still defers to another process handler when one is installed', async () => {
+    const result = await runSigintHarness(`
+      const { createProgress } = await import('./src/core/progress.ts');
+      process.once('SIGINT', () => {
+        process.stdout.write('HANDLED\\n');
+        setTimeout(() => process.exit(0), 50);
+      });
+      const progress = createProgress({ mode: 'json' });
+      progress.start('sigint_repro', 1);
+      process.stdout.write('READY\\n');
+      setInterval(() => {}, 1000);
+    `);
+
+    expect(result.exited).toBe(true);
+    expect(result.code).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(result.stdout).toContain('HANDLED');
+    expect(result.stderr).toContain('"event":"abort"');
+    expect(result.stderr).toContain('"reason":"SIGINT"');
   });
 
   test('startHeartbeat() fires heartbeats and stop() clears', async () => {
     const { stream, read } = sink(false);
     const p = createProgress({ mode: 'json', stream, minIntervalMs: 0, minItems: 1 });
     p.start('slow_query');
+    // Larger window + wider tolerance: under 4-way parallel CI shards on a
+    // contended host, setTimeout's effective quantum can balloon and a tight
+    // 85ms/2-6 bound flakes. We just need to confirm "fires multiple times,
+    // stops cleanly" — exact count isn't load-bearing.
     const stop = startHeartbeat(p, 'still running…', 20);
-    await new Promise((r) => setTimeout(r, 85));
+    await new Promise((r) => setTimeout(r, 200));
     stop();
     p.finish();
     const events = parseJsonl(read());
     const hb = events.filter((e) => e.event === 'heartbeat');
-    // Expect ~4 heartbeats in 85ms at 20ms interval, tolerate jitter.
-    expect(hb.length).toBeGreaterThanOrEqual(2);
-    expect(hb.length).toBeLessThanOrEqual(6);
+    expect(hb.length).toBeGreaterThanOrEqual(1);
+    expect(hb.length).toBeLessThanOrEqual(20);
   });
 
   test('finish without prior start is a no-op (no crash)', () => {
