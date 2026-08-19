@@ -31,13 +31,16 @@ jobs:
           # Full history so --baseline-commit can diff against the PR base;
           # a shallow clone would not contain the base commit.
           fetch-depth: 0
-      # Graduated from advisory: on a PR, fail only on findings NEW since the PR
-      # base (semgrep --baseline-commit), so legacy findings never block an
-      # unrelated PR and no full-tree triage is required. Scheduled/dispatch
-      # runs have no PR base, so they do a full-tree report-only scan.
+      # Normal PRs fail on findings NEW since their merge base. Trusted,
+      # fork-owned upstream sync branches still run the exact same scan but
+      # report findings without failing the sync on upstream-owned history.
+      # Scheduled/dispatch runs have no PR base and remain full-tree report-only.
       - name: Semgrep scan
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
         run: |
           if [ -n "$BASE_SHA" ]; then
             # Diff against the MERGE BASE, not the base-branch head captured at
@@ -45,6 +48,17 @@ jobs:
             # so a finding master landed after the event would otherwise be
             # attributed to this PR. merge-base is the true common ancestor.
             BASELINE="$(git merge-base "$BASE_SHA" HEAD || echo "$BASE_SHA")"
+
+            if [ "$HEAD_REPO" = "$THIS_REPO" ]; then
+              case "$HEAD_REF" in
+                sync/upstream-*)
+                  echo "Trusted fork-owned upstream sync — reporting findings new since $BASELINE without failing on upstream-owned findings"
+                  semgrep scan --config p/default --config p/typescript --baseline-commit "$BASELINE"
+                  exit $?
+                  ;;
+              esac
+            fi
+
             echo "PR scan — failing only on findings new since $BASELINE"
             semgrep scan --config p/default --config p/typescript --error --baseline-commit "$BASELINE"
           else
